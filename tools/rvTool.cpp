@@ -7,453 +7,642 @@
 
 #include "rvTool.h"
 
-#include <iostream>
 #include <cassert>
+#include <iostream>
 #include <sstream>
 
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/Constants.h"
 
 #include <llvm/IR/Module.h>
-#include <llvm/Bitcode/ReaderWriter.h>
-#include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/SourceMgr.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/SourceMgr.h>
 
-#include "llvm/Transforms/Utils/Cloning.h"
-#include "llvm/Transforms/Scalar.h"
-#include "llvm/IR/LegacyPassManager.h"
+#include <llvm/Analysis/MemoryDependenceAnalysis.h>
+#include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
+
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "ArgumentReader.h"
 
+#include "rv/passes.h"
+#include "rv/resolver/resolvers.h"
 #include "rv/rv.h"
+#include "rv/rvDebug.h"
+#include "rv/utils.h"
 #include "rv/vectorMapping.h"
-#include "rv/rvInfo.h"
-#include "rv/transforms/loopExitCanonicalizer.h"
-#include "rv/Region/LoopRegion.h"
+
+#include "rv/region/FunctionRegion.h"
+#include "rv/region/LoopRegion.h"
+#include "rv/region/Region.h"
+#include "rv/vectorizationInfo.h"
+
+#include "rv/analysis/reductionAnalysis.h"
+#include "rv/transform/loopExitCanonicalizer.h"
+#include "rv/transform/remTransform.h"
+#include "rv/transform/singleReturnTrans.h"
 
 using namespace llvm;
 
-Module*
-createModuleFromFile(const std::string& fileName)
-{
-    SMDiagnostic diag;
-    auto modPtr = llvm::parseIRFile(fileName, diag, llvm::getGlobalContext());
-    return modPtr.release();
+static bool OnlyAnalyze = false;
+
+static const char LISTSEPERATOR = '_';
+static const char RETURNSHAPESEPERATOR = 'r';
+
+static const char BOTCHAR = 'B';
+static const char UNICHAR = 'U';
+static const char CONTCHAR = 'C';
+static const char STRIDEDCHAR = 'S';
+static const char VARCHAR = 'T';
+
+// be verbose (rvTool level only)
+static bool verbose = false;
+#define IF_VERBOSE if (verbose)
+
+static void LLVM_ATTRIBUTE_NORETURN fail();
+
+static void fail() {
+  std::cerr << '\n';
+  assert(false);
+  exit(-1);
 }
 
-void
-writeModuleToFile(Module* mod, const std::string& fileName)
-{
-    assert (mod);
-    std::error_code EC;
-    raw_fd_ostream file(fileName, EC, sys::fs::OpenFlags::F_RW);
-    mod->print(file, nullptr);
-    if (EC)
-    {
-        errs() << "ERROR: printing module to file failed: " << EC.message() << "\n";
-        return;
+template <class... Args> static void fail(std::string arg, Args... rest) {
+  std::cerr << arg;
+  fail(rest...);
+}
+
+Module *createModuleFromFile(const std::string &fileName,
+                             LLVMContext &context) {
+  SMDiagnostic diag;
+  auto modPtr = llvm::parseIRFile(fileName, diag, context);
+  return modPtr.release();
+}
+
+void writeModuleToFile(Module *mod, const std::string &fileName) {
+  assert(mod);
+  std::error_code EC;
+  raw_fd_ostream file(fileName, EC);
+  mod->print(file, nullptr);
+  if (EC) {
+    fail("ERROR: printing module to file failed: ", EC.message());
+  }
+  file.close();
+}
+
+void normalizeFunction(Function &F) {
+  legacy::FunctionPassManager FPM(F.getParent());
+  FPM.add(rv::createCNSPass());
+  FPM.add(createPromoteMemoryToRegisterPass());
+  FPM.add(createLoopSimplifyPass());
+  FPM.add(createLCSSAPass());
+  FPM.run(F);
+
+  rv::FunctionRegion funcRegion(F);
+  rv::Region regWrapper(funcRegion);
+  rv::SingleReturnTrans::run(regWrapper);
+}
+
+void vectorizeLoop(Function &parentFn, Loop &loop, unsigned vectorWidth,
+                   LoopInfo &loopInfo, DominatorTree &domTree,
+                   PostDominatorTree &postDomTree, int ulpErrorBound) {
+  // assert: function is already normalized
+  Module &mod = *parentFn.getParent();
+
+  // set up analysis infrastructure
+  FunctionAnalysisManager fam;
+  ModuleAnalysisManager mam;
+
+  PassBuilder PB;
+  PB.registerFunctionAnalyses(fam);
+  PB.registerModuleAnalyses(mam);
+
+  // query LLVM passes
+  TargetIRAnalysis irAnalysis;
+  TargetTransformInfo tti = irAnalysis.run(parentFn, fam);
+  TargetLibraryAnalysis libAnalysis;
+  TargetLibraryInfo tli = libAnalysis.run(*parentFn.getParent(), mam);
+
+  ScalarEvolutionAnalysis seAnalysis;
+  ScalarEvolution SE = seAnalysis.run(parentFn, fam);
+
+  // set-up for loop vectorization
+  rv::ReductionAnalysis reductionAnalysis(parentFn, loopInfo);
+  reductionAnalysis.analyze(loop);
+
+  ValueSet uniOverrides;
+  rv::RemainderTransform remTrans(parentFn, domTree, postDomTree, loopInfo,
+                                  reductionAnalysis);
+  auto *preparedLoop = remTrans.createVectorizableLoop(
+      loop, uniOverrides, vectorWidth, vectorWidth);
+
+  if (!preparedLoop) {
+    fail("remTrans could not transform to a vectorizable loop.");
+  }
+
+  // configure RV
+  auto config = rv::Config::createForFunction(parentFn);
+  config.maxULPErrorBound = ulpErrorBound;
+  IF_VERBOSE { config.print(outs()); }
+
+  // setup region
+  rv::LoopRegion loopRegionImpl(*preparedLoop);
+  rv::Region loopRegion(loopRegionImpl);
+  rv::VectorizationInfo vecInfo(parentFn, vectorWidth, loopRegion);
+
+  rv::PlatformInfo platInfo(mod, &tti, &tli);
+
+  MemoryDependenceAnalysis mdAnalysis;
+  MemoryDependenceResults MDR = mdAnalysis.run(parentFn, fam);
+
+  // link in SIMD library
+  addSleefResolver(config, platInfo);
+  // vectorize recursively
+  addRecursiveResolver(config, platInfo);
+
+  // Check reduction patterns of vector loop phis
+  // configure initial shape for induction variable
+  for (auto &inst : *preparedLoop->getHeader()) {
+    auto *phi = dyn_cast<PHINode>(&inst);
+    if (!phi)
+      continue;
+
+    IF_VERBOSE { errs() << "loopVecPass: header phi  " << *phi << " : "; }
+
+    rv::StridePattern *pat = reductionAnalysis.getStrideInfo(*phi);
+    rv::VectorShape phiShape;
+    if (pat) {
+      IF_VERBOSE { pat->dump(); }
+      phiShape = pat->getShape(vectorWidth);
+
+    } else {
+      rv::Reduction *redInfo = reductionAnalysis.getReductionInfo(*phi);
+
+      if (!redInfo) {
+        errs() << "\n\tskip: unrecognized phi use in vector loop "
+               << preparedLoop->getName() << "\n";
+        fail();
+      } else {
+        IF_VERBOSE { redInfo->dump(); }
+        phiShape = redInfo->getShape(vectorWidth);
+      }
     }
-    file.close();
-}
 
-void
-normalizeFunction(Function& F)
-{
-    legacy::FunctionPassManager FPM(F.getParent());
-    FPM.add(createLoopSimplifyPass());
-    FPM.add(createLCSSAPass());
-    FPM.run(F);
-}
-
-static Value*
-GetInitValue(Loop& loop, PHINode& phi)
-{
-    for (uint i = 0; i < phi.getNumIncomingValues(); ++i)
-    {
-        if (!loop.contains(phi.getIncomingBlock(i)))
-        {
-            return phi.getIncomingValue(i);
-        }
-    }
-    return nullptr;
-}
-
-static bool
-AdjustStride(Loop& loop, PHINode& phi, uint vectorWidth)
-{
-    Instruction* increment = nullptr;
-    for (uint i = 0; i < phi.getNumIncomingValues(); ++i)
-    {
-        auto* inVal = phi.getIncomingValue(i);
-        auto* inInst = dyn_cast<Instruction>(inVal);
-        if (!inInst || !loop.contains(inInst->getParent()))
-        {
-            continue;
-        }
-        if (!inInst || (inInst->getOpcode() != Instruction::Add))
-        { continue; }
-        increment = inInst;
-        break;
+    IF_VERBOSE {
+      errs() << "header phi " << phi->getName() << " has shape "
+             << phiShape.str() << "\n";
     }
 
-    // bump up loop increment to vector width
-    assert(increment);
-    uint constPos = isa<Constant>(increment->getOperand(1)) ? 1 : 0;
-    auto* incStep = cast<ConstantInt>(increment->getOperand(constPos));
-    assert(incStep->getLimitedValue() == 1);
-    auto* vectorIncStep = ConstantInt::getSigned(incStep->getType(), vectorWidth);
-    increment->setOperand(constPos, vectorIncStep);
+    if (phiShape.isDefined()) {
+      vecInfo.setPinnedShape(*phi, phiShape);
+    }
+  }
 
-    return true;
-}
+  // set uniform overrides
+  IF_VERBOSE { errs() << "-- Setting remTrans uni overrides --\n"; }
+  for (auto *val : uniOverrides) {
+    IF_VERBOSE { errs() << "- " << *val << "\n"; }
+    vecInfo.setPinnedShape(*val, rv::VectorShape::uni());
+  }
 
-void
-vectorizeLoop(Function& parentFn, Loop& loop, uint vectorWidth, LoopInfo& loopInfo, DFG& dfg,
-              CDG& cdg, DominatorTree& domTree, PostDominatorTree& postDomTree)
-{
-    // assert: function is already normalized
+  rv::VectorizerInterface vectorizer(platInfo, config);
 
-    Module& mod = *parentFn.getParent();
-    auto* rvInfo = new rv::RVInfo(&mod,
-                                  &mod.getContext(),
-                                  &parentFn,
-                                  &parentFn,
-                                  vectorWidth,
-                                  -1, // mask position
-                                  false /* disableMemAccessAnalysis */,
-                                  false /* disableControlFlowDivAnalysis */,
-                                  false /* disableAllAnalyses */,
-                                  false,
-                                  nullptr);
+  // early math func lowering
+  vectorizer.lowerRuntimeCalls(vecInfo, loopInfo);
+  domTree.recalculate(parentFn);
+  postDomTree.recalculate(parentFn);
 
-    // set-up for loop vectorization
-    rv::VectorMapping targetMapping(&parentFn, &parentFn, vectorWidth);
+  IF_VERBOSE { loopInfo.print(errs()); }
+  loopInfo.verify(domTree);
 
-    rv::LoopRegion loopRegionImpl(loop);
-    rv::Region loopRegion(loopRegionImpl);
-    VectorizationInfo vecInfo(parentFn, vectorWidth, loopRegion);
+  // vectorizationAnalysis
+  vectorizer.analyze(vecInfo, domTree, postDomTree, loopInfo);
 
-    // configure initial shape for induction variable
-    auto* header = loop.getHeader();
-    PHINode* xPhi = cast<PHINode>(&*header->begin());
-    auto* xPhiInit = GetInitValue(loop, *xPhi);
-    errs() << "Vectorizing loop with induction variable " << *xPhi << "\n";
-    vecInfo.setVectorShape(*xPhi, rv::VectorShape::strided(1, vectorWidth));
-    vecInfo.setVectorShape(*xPhiInit, rv::VectorShape::strided(1, vectorWidth));
+  if (OnlyAnalyze) {
+    vecInfo.print(outs());
+    return;
+  }
 
-    // configure exit condition to be non-divergent in any case
-    auto* exitBlock = loop.getExitingBlock();
-    assert(exitBlock && "does not have a unique exit block!");
-    vecInfo.setVectorShape(*exitBlock->getTerminator(), rv::VectorShape::uni());
-    vecInfo.setVectorShape(*cast<BranchInst>(exitBlock->getTerminator())->getOperand(0),
-                           rv::VectorShape::uni());
+  // control conversion
+  vectorizer.linearize(vecInfo, domTree, postDomTree, loopInfo);
+  // if (!maskEx) fail("mask generation failed.");
 
-    bool matched = AdjustStride(loop, *xPhi, vectorWidth);
-    assert(matched && "could not match ++i loop pattern");
+  DominatorTree domTreeNew(
+      *vecInfo.getMapping()
+           .scalarFn); // Control conversion does not preserve the domTree so we
+                       // have to rebuild it for now
+  bool vectorizeOk =
+      vectorizer.vectorize(vecInfo, domTreeNew, loopInfo, SE, MDR, nullptr);
+  if (!vectorizeOk)
+    fail("vector code generation failed");
 
-    rv::VectorizerInterface vectorizer(*rvInfo, &parentFn);
-
-    // vectorizationAnalysis
-    vectorizer.analyze(vecInfo, cdg, dfg, loopInfo, postDomTree, domTree);
-
-    // mask analysis
-    MaskAnalysis* maskAnalysis = vectorizer.analyzeMasks(vecInfo, loopInfo);
-    assert(maskAnalysis);
-    maskAnalysis->print(errs(), &mod);
-
-    // mask generator
-    bool genMaskOk = vectorizer.generateMasks(vecInfo, *maskAnalysis, loopInfo);
-    assert(genMaskOk);
-
-    // control conversion
-    bool linearizeOk = vectorizer.linearizeCFG(vecInfo, *maskAnalysis, loopInfo, postDomTree,
-                                               domTree);
-    assert(linearizeOk);
-
-    const DominatorTree domTreeNew(*vecInfo.getMapping()
-                                           .scalarFn); // Control conversion does not preserve the domTree so we have to rebuild it for now
-    bool vectorizeOk = vectorizer.vectorize(vecInfo, domTreeNew);
-    assert(vectorizeOk);
-
-    // cleanup
-    vectorizer.finalize();
-
-    delete maskAnalysis;
-    delete rvInfo;
+  // cleanup
+  vectorizer.finalize();
 }
 
 // Use case: Outer-loop Vectorizer
-void
-vectorizeFirstLoop(Function& parentFn, uint vectorWidth)
-{
-    // normalize
-    normalizeFunction(parentFn);
+void vectorizeFirstLoop(Function &parentFn, unsigned vectorWidth, int ulpErrorBound) {
+  // normalize
+  normalizeFunction(parentFn);
 
-    // build Analysis
-    DominatorTree domTree(parentFn);
-    PostDominatorTree postDomTree;
-    postDomTree.runOnFunction(parentFn);
+  // build Analysis
+  DominatorTree domTree(parentFn);
+
+  // normalize loop exits
+  {
     LoopInfo loopInfo(domTree);
-
-    // Dominance Frontier Graph
-    DFG dfg(domTree);
-    dfg.create(parentFn);
-
-    // Control Dependence Graph
-    CDG cdg(*postDomTree.DT);
-    cdg.create(parentFn);
-
-    // normalize loop exits
     LoopExitCanonicalizer canonicalizer(loopInfo);
     canonicalizer.canonicalize(parentFn);
+    domTree.recalculate(parentFn);
+  }
 
-    if (loopInfo.begin() == loopInfo.end())
-    {
-        return;
-    }
+  // compute actual analysis structures
+  LoopInfo loopInfo(domTree);
 
-    auto* firstLoop = *loopInfo.begin();
+  if (loopInfo.begin() == loopInfo.end()) {
+    return;
+  }
 
-    vectorizeLoop(parentFn, *firstLoop, vectorWidth, loopInfo, dfg, cdg, domTree, postDomTree);
+  // post dom
+  PostDominatorTree postDomTree;
+  postDomTree.recalculate(parentFn);
 
-    // mark region
-    // run RV
-    // replace stride
+  // dump normalized function
+  IF_VERBOSE {
+    errs() << "-- normalized functions --\n";
+    parentFn.print(errs());
+  }
+
+  auto *firstLoop = *loopInfo.begin();
+  vectorizeLoop(parentFn, *firstLoop, vectorWidth, loopInfo, domTree,
+                postDomTree, ulpErrorBound);
+
+  // mark region
+  // run RV
+  // replace stride
 }
-
+using ShapeMap = std::map<std::string, rv::VectorShape>;
 
 // Use case: Whole-Function Vectorizer
-void
-vectorizeFunction(rv::VectorMapping& vectorizerJob)
-{
-    Function* scalarFn = vectorizerJob.scalarFn;
-    Function* vectorFn = vectorizerJob.vectorFn;
-    Module& mod = *scalarFn->getParent();
+void vectorizeFunction(rv::VectorMapping &vectorizerJob, ShapeMap extraShapes, bool generateVectorName, int ulpErrorBound) {
+  Function *scalarFn = vectorizerJob.scalarFn;
+  Module &mod = *scalarFn->getParent();
 
-    auto* rvInfo = new rv::RVInfo(&mod,
-                                  &mod.getContext(),
-                                  scalarFn,
-                                  vectorFn,
-                                  vectorizerJob.vectorWidth,
-                                  -1, // mask position
-                                  false /* disableMemAccessAnalysis */,
-                                  false /* disableControlFlowDivAnalysis */,
-                                  false /* disableAllAnalyses */,
-                                  false,
-                                  nullptr);
+  FunctionAnalysisManager fam;
+  ModuleAnalysisManager mam;
 
-    // clone source function for transformations
-    ValueToValueMapTy valueMap;
-    Function* scalarCopy = CloneFunction(scalarFn, valueMap, false);
+  // setup LLVM analysis infrastructure
+  PassBuilder PB;
+  PB.registerFunctionAnalyses(fam);
+  PB.registerModuleAnalyses(mam);
 
-    assert (scalarCopy);
-    scalarCopy->setCallingConv(scalarFn->getCallingConv());
-    scalarCopy->setAttributes(scalarFn->getAttributes());
-    scalarCopy->setAlignment(scalarFn->getAlignment());
-    scalarCopy->setLinkage(GlobalValue::InternalLinkage);
-    scalarCopy->setName(scalarFn->getName() + ".vectorizer.tmp");
-    mod.getFunctionList().push_back(scalarCopy);
+  // platform API
+  TargetIRAnalysis irAnalysis;
+  TargetTransformInfo tti = irAnalysis.run(*scalarFn, fam);
+  TargetLibraryAnalysis libAnalysis;
+  TargetLibraryInfo tli = libAnalysis.run(mod, mam);
+  rv::PlatformInfo platInfo(mod, &tti, &tli);
 
-    // normalize
-    normalizeFunction(*scalarCopy);
+  // assign a proper vector function name
+  if (generateVectorName) {
+    auto scaName = scalarFn->getName();
+    auto mangledVectorName = platInfo.createMangledVectorName(scaName, vectorizerJob.argShapes, vectorizerJob.vectorWidth, vectorizerJob.maskPos);
+    vectorizerJob.vectorFn->setName(mangledVectorName);
+  }
 
-    // set-up vectorizer
-    rv::VectorMapping targetMapping = vectorizerJob;
-    targetMapping.scalarFn = scalarCopy;
-    VectorizationInfo vecInfo(targetMapping);
+  // clone source function for transformations
+  ValueToValueMapTy valueMap;
+  Function *scalarCopy = CloneFunction(scalarFn, valueMap, nullptr);
 
-    rv::VectorizerInterface vectorizer(*rvInfo, scalarCopy);
+  // emit a rv_entry_mask call to get a hold off the "future" function entry
+  // mask (which will ultimately be available as a function argument in the
+  // vectorized function we are about to generate).
+  if (vectorizerJob.maskPos >= 0) {
+    MaterializeEntryMask(*scalarCopy, platInfo);
+  }
 
-#if 1
-    // link in SIMD library
-    const bool useSSE = false;
-    const bool useSSE41 = false;
-    const bool useSSE42 = false;
-    const bool useNEON = false;
-    const bool useAVX = true;
-    rvInfo->addCommonMappings(useSSE, useSSE41, useSSE42, useAVX, useNEON);
-#endif
+  assert(scalarCopy);
+  scalarCopy->setCallingConv(scalarFn->getCallingConv());
+  scalarCopy->setAttributes(scalarFn->getAttributes());
+  scalarCopy->setAlignment(scalarFn->getAlignment());
+  scalarCopy->setLinkage(GlobalValue::InternalLinkage);
+  scalarCopy->setName(scalarFn->getName() + ".vectorizer.tmp");
 
-    // build Analysis
-    const DominatorTree domTree(*scalarCopy);
-    PostDominatorTree postDomTree;
-    postDomTree.runOnFunction(*scalarCopy);
+  // normalize
+  normalizeFunction(*scalarCopy);
+
+  // configure RV
+  auto config = rv::Config::createForFunction(*scalarFn);
+  config.maxULPErrorBound = ulpErrorBound;
+  IF_VERBOSE { config.print(outs()); }
+
+  // link in SIMD library
+  addSleefResolver(config, platInfo);
+  // vectorize recursively
+  addRecursiveResolver(config, platInfo);
+
+  rv::VectorizerInterface vectorizer(platInfo, config);
+
+  // set-up vecInfo overlay and define vectorization job (mapping)
+  rv::VectorMapping targetMapping = vectorizerJob;
+  targetMapping.scalarFn = scalarCopy;
+  rv::FunctionRegion funcRegion(*scalarCopy);
+  rv::Region funcRegionWrapper(funcRegion);
+  rv::VectorizationInfo vecInfo(funcRegionWrapper, targetMapping);
+
+  // transfer extra shapes
+  for (auto &it : extraShapes) {
+    auto name = it.first;
+    auto shape = it.second;
+
+    auto *gv = mod.getGlobalVariable(name);
+    auto *vecFun = mod.getFunction(name);
+
+    if (vecFun) {
+      // interpret <shape> as result shape
+      rv::VectorMapping vecFuncMap(vecFun, vecFun, 0, rv::CallPredicateMode::SafeWithoutPredicate);
+      vecFuncMap.resultShape = shape;
+      platInfo.addMapping(vecFuncMap);
+      outs() << "rvTool func mapping: ";
+      vecFuncMap.print(outs());
+
+    } else if (gv) {
+      // interpret <shape> as shape of gvar address
+      vecInfo.setPinnedShape(*gv, shape);
+    }
+  }
+
+  // build Analysis
+  DominatorTree domTree(*scalarCopy);
+  // normalize loop exits
+  {
     LoopInfo loopInfo(domTree);
-
-    // Dominance Frontier Graph
-    DFG dfg(domTree);
-    dfg.create(*scalarCopy);
-
-    // Control Dependence Graph
-    CDG cdg(*postDomTree.DT);
-    cdg.create(*scalarCopy);
-
-    // normalize loop exits
     LoopExitCanonicalizer canonicalizer(loopInfo);
     canonicalizer.canonicalize(*scalarCopy);
+    domTree.recalculate(*scalarCopy);
+  }
 
-    // vectorizationAnalysis
-    vectorizer.analyze(vecInfo, cdg, dfg, loopInfo, postDomTree, domTree);
+  LoopInfo loopInfo(domTree);
 
-    // mask analysis
-    MaskAnalysis* maskAnalysis = vectorizer.analyzeMasks(vecInfo, loopInfo);
-    assert(maskAnalysis);
+  ScalarEvolutionAnalysis seAnalysis;
+  ScalarEvolution SE = seAnalysis.run(*scalarCopy, fam);
 
-    // mask generator
-    bool genMaskOk = vectorizer.generateMasks(vecInfo, *maskAnalysis, loopInfo);
-    assert(genMaskOk);
+  MemoryDependenceAnalysis mdAnalysis;
+  MemoryDependenceResults MDR = mdAnalysis.run(*scalarCopy, fam);
 
-    // control conversion
-    bool linearizeOk = vectorizer.linearizeCFG(vecInfo, *maskAnalysis, loopInfo, postDomTree,
-                                               domTree);
-    assert(linearizeOk);
+  // post dom
+  PostDominatorTree postDomTree;
+  postDomTree.recalculate(*scalarCopy);
 
-    const DominatorTree domTreeNew(*vecInfo.getMapping()
-                                           .scalarFn); // Control conversion does not preserve the domTree so we have to rebuild it for now
-    bool vectorizeOk = vectorizer.vectorize(vecInfo, domTreeNew);
-    assert(vectorizeOk);
+  // Control Dependence Graph
 
-    // cleanup
-    vectorizer.finalize();
+  // dump normalized function
+  IF_VERBOSE {
+    errs() << "-- normalized functions --\n";
+    scalarCopy->print(errs());
+  }
 
-    delete maskAnalysis;
-    scalarCopy->eraseFromParent();
+  // early math func lowering
+  vectorizer.lowerRuntimeCalls(vecInfo, loopInfo);
+  domTree.recalculate(*scalarCopy);
+  postDomTree.recalculate(*scalarCopy);
+
+  IF_VERBOSE { loopInfo.print(errs()); }
+  loopInfo.verify(domTree);
+
+  // vectorizationAnalysis
+  vectorizer.analyze(vecInfo, domTree, postDomTree, loopInfo);
+  if (OnlyAnalyze) {
+    vecInfo.print(outs());
+    return;
+  }
+
+  // mask generator
+  vectorizer.linearize(vecInfo, domTree, postDomTree, loopInfo);
+  // if (!maskEx) fail("mask generation failed.");
+
+  // Control conversion does not preserve the domTree so we have to rebuild it
+  // for now
+  DominatorTree domTreeNew(*vecInfo.getMapping().scalarFn);
+  bool vectorizeOk =
+      vectorizer.vectorize(vecInfo, domTreeNew, loopInfo, SE, MDR, nullptr);
+  if (!vectorizeOk)
+    fail("vector code generation failed.");
+
+  // cleanup
+  vectorizer.finalize();
+
+  scalarCopy->eraseFromParent();
 }
 
-Type*
-vectorizeType(Type* scalarTy, rv::VectorShape shape, uint vectorWidth)
-{
-    if (scalarTy->isVoidTy()) return scalarTy;
-    if (!shape.isDefined() || shape.hasStridedShape()) return scalarTy;
-
-    return VectorType::get(scalarTy, vectorWidth);
+unsigned readNumber(std::stringstream &shapeText) {
+  unsigned number;
+  shapeText >> number;
+  assert(!shapeText.fail() && "expected a number!");
+  return number;
 }
 
-Function*
-createVectorDeclaration(Function& scalarFn, rv::VectorShape resShape,
-                        const rv::VectorShapeVec& argShapes, uint vectorWidth)
-{
-    auto* scalarFnTy = scalarFn.getFunctionType();
+unsigned decodeAlignment(std::stringstream &shapeText) {
+  if (shapeText.get() != 'a')
+    return shapeText.unget(), 1U; // expect 'a' or rollback, return 1
 
-    auto* vectorRetTy = vectorizeType(scalarFnTy->getReturnType(), resShape, vectorWidth);
-
-    std::vector<Type*> vectorArgTys;
-    for (uint i = 0; i < scalarFnTy->getNumParams(); ++i)
-    {
-        auto* scalarArgTy = scalarFnTy->getParamType(i);
-        rv::VectorShape argShape = argShapes[i];
-        vectorArgTys.push_back(vectorizeType(scalarArgTy, argShape, vectorWidth));
-    }
-
-    auto* vectorFnTy = FunctionType::get(vectorRetTy, vectorArgTys, false);
-
-    return llvm::Function::Create(vectorFnTy, scalarFn.getLinkage(), scalarFn.getName() + "_SIMD",
-                                  scalarFn.getParent());
+  return readNumber(shapeText);
 }
 
-unsigned
-readNumber(std::string shapeText, unsigned& pos)
-{
-    unsigned alignment = 0U;
-
-    auto toint = [](char c) { return static_cast<unsigned>(c - '0'); };
-
-    for (; isdigit(shapeText[pos]); ++pos)
-    {
-        alignment = alignment * 10 + toint(shapeText[pos]);
-    }
-
-    return alignment;
+template <typename Elem_Reader_t>
+void readList(int sep, std::stringstream &listText, Elem_Reader_t reader) {
+  bool next;
+  do {
+    reader(listText); // read one element
+    int c = listText.peek();
+    next = c == sep; // check if the list ends here
+    if (next)
+      listText.ignore(1); // skip seperator
+  } while (next);
 }
-
-unsigned
-decodeAlignment(std::string shapeText, unsigned& pos)
+#if 0
+template <char SEPERATOR, typename Elem_t, typename Elem_Reader_t, typename ... ReaderArgTypes>
+void readList(std::stringstream& listText,
+              std::vector<Elem_t>& vec,
+              Elem_Reader_t reader,
+              ReaderArgTypes... args)
 {
-    if (pos >= shapeText.size()) return 1U;
-
-    if (shapeText[pos] != 'a') return 1U;
-
-    ++pos;
-
-    if (!isdigit(shapeText[pos])) return 1U; // alignment omitted, assume 1
-
-    return readNumber(shapeText, pos);
+    bool next;
+    do {
+        vec.push_back(reader(listText, args...));  // read one element
+        int c = listText.peek();
+        next = c == SEPERATOR;            // check if the list ends here
+        if (next) listText.ignore(1);     // skip seperator
+    } while (next);
 }
+#endif
 
-rv::VectorShape
-decodeShape(std::string shapeText, unsigned& pos)
-{
-    char c = shapeText[pos++];
-    unsigned stridedOf = 0;
+rv::VectorShape decodeShape(std::stringstream &shapestream) {
+  int c = shapestream.get();
 
-    // For 'S' a following stride is expected
-    if (c == 'S')
-    {
-        assert (isdigit(shapeText[pos]) && "expected a stride after 'S'!");
-        stridedOf = readNumber(shapeText, pos);
-    }
-
-    unsigned alignment = decodeAlignment(shapeText, pos);
-
-    if (c == 'C')      return rv::VectorShape::cont(alignment);
-    else if (c == 'T') return rv::VectorShape::varying(alignment);
-    else if (c == 'U') return rv::VectorShape::uni(alignment);
-    else if (c == 'S') return rv::VectorShape::strided(stridedOf, alignment);
-
+  if (c == BOTCHAR)
     return rv::VectorShape::undef();
+
+  unsigned alignment = decodeAlignment(shapestream);
+
+  if (c == CONTCHAR)
+    return rv::VectorShape::cont(alignment);
+  else if (c == VARCHAR)
+    return rv::VectorShape::varying(alignment);
+  else if (c == UNICHAR)
+    return rv::VectorShape::uni(alignment);
+
+  unsigned stridedOf = readNumber(shapestream);
+
+  if (c == STRIDEDCHAR)
+    return rv::VectorShape::strided(stridedOf, alignment);
+
+  fail("Expected stride specifier.");
+  abort();
 }
 
-int main(int argc, char** argv)
-{
-    ArgumentReader reader(argc, argv);
+static void PrintHelp() {
+  std::cerr << "RV command line tool (rvTool)\n"
+            << "No command specified!\n"
+            << "-i MODULE [-k KERNELNAME] [-t TARGET_DECL] [-normalize] ..."
+               "[-lower] [-v] "
+            << "[-o OUTPUT_LL] [-w 8] [-s SHAPES] [-x GV_SHAPES]\n"
+            << "\nCommands:\n"
+            << "-wfv/-loopvec      : vectorize a whole-function or an outer loop\n"
+            << "-analyze           : normalize, print vectorization analysis "
+               "results and exit.\n"
+            << "-lower-func        : lower predicate intrinsics in scalar kernel.\n"
+            << "-lower             : lower predicate intrinsics in entire module.\n"
+            << "-normalize         : normalize kernel and quit.\n"
+            << "\nOptions:\n"
+            << "-i MODULE          : LLVM input module.\n"
+            << "-o MODULE          : LLVM output module.\n"
+            << "-k KERNEL          : name of the function to vectorize/function "
+               "with loop to vectorize.\n"
+            << "-t DECL            : target SIMD declaration (WFV mode only, will "
+               "be auto generated if missing).\n"
+            << "-s SHAPES          : WFV argument shapes.\n"
+            << "-m MaskPos         : (wfv only) mask argument position.\n"
+            << "--math-prec <ulp>  : ULP error bound on math functions (n/10).\n"
+            << "-x GVSHAPES        : comma-separated list of global value and "
+               "function-return shapes, e.g. \"gvar=C,func=S4\".\n"
+            << "-w WIDTH           : vectorization factor.\n"
+            << "-v                 : enable verbose output (rvTool level output).\n";
+}
 
-    std::string inFile;
-    bool hasFile = reader.readOption<std::string>("-i", inFile);
+int main(int argc, char **argv) {
+  ArgumentReader reader(argc, argv);
 
-    std::string kernelName;
-    bool hasKernelName = reader.readOption<std::string>("-k", kernelName);
+  // verbose debug output (rvTool level)
+  verbose = reader.hasOption("-v");
 
-    bool wfvMode = reader.hasOption("-wfv");
-    bool loopVecMode = reader.hasOption("-loopvec");
+  std::string inFile;
+  bool hasFile = reader.readOption<std::string>("-i", inFile);
 
-    std::string targetDeclName;
-    bool hasTargetDeclName = reader.readOption<std::string>("-t", targetDeclName);
+  std::string kernelName;
+  bool hasKernelName = reader.readOption<std::string>("-k", kernelName);
 
+  OnlyAnalyze = reader.hasOption("-analyze"); // global
+  bool wfvMode = reader.hasOption("-wfv");
+  bool loopVecMode = reader.hasOption("-loopvec");
 
-    std::string outFile;
-    bool hasOutFile = reader.readOption<std::string>("-o", outFile);
+  std::string targetDeclName;
+  bool hasTargetDeclName = reader.readOption<std::string>("-t", targetDeclName);
 
-    bool onlyAnalyze = reader.hasOption("--analyze");
+  bool lowerIntrinsicsFunc = reader.hasOption("-lower-func");
+  bool lowerIntrinsicsMod = reader.hasOption("-lower");
+  int maskPos = -1;
+  reader.readOption<int>("-m", maskPos);
 
-    if (!(hasFile && hasKernelName))
-    {
-        std::cerr << "Not all arguments specified -wfv/-loopvec) "
-                  << "-i MODULE -k KERNELNAME [-target TARGET_DECL]"
-                  << "[-o OUTPUT_LL] [-w 8] [--vectorize] [--analyze\n";
+  std::string outFile;
+  bool hasOutFile = reader.readOption<std::string>("-o", outFile);
+
+  bool runNormalize = reader.hasOption("-normalize");
+
+  int ulpErrorBound = 10;
+  reader.readOption<int>("--math-prec", ulpErrorBound);
+  IF_VERBOSE { errs() << "SLEEF ulpErrorBound: " << (ulpErrorBound/10.0) << "\n"; }
+
+  if (!hasFile) {
+    PrintHelp();
+    return -1;
+  }
+
+  LLVMContext context;
+
+  // Load module
+  llvm::Module *mod = createModuleFromFile(inFile, context);
+  if (!mod) {
+    errs() << "Could not load module " << inFile << ". Aborting!\n";
+    return 1;
+  }
+
+  bool broken = verifyModule(*mod, &errs());
+  if (broken) {
+    errs() << "Broken module!\n";
+    return 1;
+  }
+
+  bool finish = false;
+
+  // run normalization and quit
+  if (runNormalize) {
+    for (auto &func : *mod) {
+      normalizeFunction(func);
+      bool broken = verifyFunction(func, &errs());
+      if (broken) {
+        errs() << func.getName() << "\n";
+        fail("Function broken");
         return -1;
+      }
     }
 
-    // Load module
-    llvm::LLVMContext& context = llvm::getGlobalContext();
-    llvm::Module* mod = createModuleFromFile(inFile);
-    if (!mod)
-    {
-        errs() << "Could not load module " << inFile << ". Aborting!\n";
-        return 1;
-    }
-    llvm::Function* scalarFn = mod->getFunction(kernelName);
-    if (!scalarFn)
-    {
-        return 2;
+    finish = true;
+  }
+
+  // parse additional global variable shapes "-x gvName=shape,gvName2=shape2"
+  ShapeMap shapeMap;
+  std::string extraShapeText;
+  if (reader.readOption<std::string>("-x", extraShapeText)) {
+    std::stringstream shapeStream(extraShapeText);
+    readList(',', shapeStream, [&shapeMap](std::stringstream &in) {
+      std::string gvName, shapeText;
+      if (!std::getline(in, gvName, '=')) {
+        fail("could not parse global variable shape!");
+      }
+      rv::VectorShape gvShape = decodeShape(in);
+      shapeMap[gvName] = gvShape;
+      std::cerr << "USER SHAPE " << gvName << " set to " << gvShape.str()
+                << "\n";
+    });
+  }
+
+  // TODO factor out
+  if (!finish) {
+    // WFV / loopVec mode
+    if (!hasKernelName) {
+      std::cerr << "kernel name argument missing!\n";
+      return -1;
     }
 
+    llvm::Function *scalarFn = mod->getFunction(kernelName);
+    if (!scalarFn) {
+      return 2;
+    }
     // initialize argument mapping
     // first arg cons, all others uniform mapping
     // TODO apply user mappings
@@ -461,86 +650,92 @@ int main(int argc, char** argv)
     rv::VectorShape resShape;
     rv::VectorShapeVec argShapes;
     std::string shapeText;
-    if (reader.readOption<std::string>("-s", shapeText))
-    {
-        uint i = 0;
-        for (auto& it : scalarFn->getArgumentList())
-        {
-            if (i >= shapeText.size())
-            {
-                argShapes.push_back(rv::VectorShape::uni());
-                continue;
-            }
-            rv::VectorShape argShape = decodeShape(shapeText, i);
-            argShapes.push_back(argShape);
-        }
-        if (shapeText.size() > i + 1)
-        { // return shape
-            assert(shapeText[i++] == 'r' && "expected return shape");
-            resShape = decodeShape(shapeText, i);
-        }
+    if (reader.readOption<std::string>("-s", shapeText)) {
+      std::stringstream shapestream(shapeText);
+      // allow functions without arguments
+      if (shapestream.peek() != 'r') {
+        readList<>(LISTSEPERATOR, shapestream,
+                   [&argShapes](decltype(shapestream) &in) {
+                     argShapes.push_back(decodeShape(in));
+                   });
+      }
 
-    }
-    else
-    {
-        for (auto& it : scalarFn->getArgumentList())
-        {
-            argShapes.push_back(rv::VectorShape::uni());
-        }
-    }
+      // fail on excessive specification
+      if (argShapes.size() > scalarFn->arg_size()) {
+        fail("too many arg shapes specified");
+      }
 
-    uint vectorWidth = reader.getOption<uint>("-w", 8);
+      // pad with uniform shapes
+      while (argShapes.size() < scalarFn->arg_size()) {
+        argShapes.push_back(rv::VectorShape::uni());
+      }
 
-    if (wfvMode)
-    {
+      if (shapestream.peek() != EOF) { // return shape
+        if (shapestream.get() != RETURNSHAPESEPERATOR)
+          fail("expected return shape");
+        resShape = decodeShape(shapestream);
+      }
 
-        // Create simd decl
-        Function* vectorFn = nullptr;
-        if (!hasTargetDeclName)
-        {
-            errs()
-                    << "No target function declaration given (-target <NAME>), creating declaration with same signature "
-                    << scalarFn->getName() << "_SIMD(..) \n";
-            vectorFn = createVectorDeclaration(*scalarFn, resShape, argShapes, vectorWidth);
-        }
-        else
-        {
-            vectorFn = mod->getFunction(targetDeclName);
-            // TODO verify shapes
-            if (!vectorFn)
-            {
-                llvm::errs() << "Target declaration " << targetDeclName
-                             << " not found. Aborting!\n";
-                return 3;
-            }
-        }
-        assert(vectorFn);
-        mod->dump();
-
-        rv::VectorMapping vectorizerJob(scalarFn, vectorFn, vectorWidth, -1, resShape, argShapes);
-
-        // Vectorize
-        errs() << "\nVectorizing kernel \"" << vectorizerJob.scalarFn->getName()
-               << "\" into declaration \"" << vectorizerJob.vectorFn->getName()
-               << "\" with vector size " << vectorizerJob.vectorWidth << "... \n";
-        vectorizeFunction(vectorizerJob);
-
-    }
-    else if (loopVecMode)
-    {
-        vectorizeFirstLoop(*scalarFn, vectorWidth);
+    } else {
+      for (auto &it : scalarFn->args()) {
+        (void)it;
+        argShapes.push_back(rv::VectorShape::uni());
+      }
     }
 
-    //output
-    if (hasOutFile)
-    {
-        writeModuleToFile(mod, outFile);
-        errs() << "Final module written to \"" << outFile << "\"\n";
-    }
-    else
-    {
-        mod->dump();
+    unsigned vectorWidth = reader.getOption<unsigned>("-w", 8);
+
+    if (wfvMode) {
+      // request SIMD decl (with a requested name, if any)
+      Function *vectorFn = hasTargetDeclName ? mod->getFunction(targetDeclName) : nullptr;
+      if (!vectorFn) {
+        vectorFn = rv::createVectorDeclaration(*scalarFn, resShape, argShapes,
+                                               vectorWidth, maskPos);
+
+        if (hasTargetDeclName) vectorFn->setName(targetDeclName);
+      }
+      assert(vectorFn);
+
+      auto predMode = maskPos >= 0 ? rv::CallPredicateMode::PredicateArg : rv::CallPredicateMode::SafeWithoutPredicate;
+      rv::VectorMapping vectorizerJob(scalarFn, vectorFn, vectorWidth, maskPos,
+                                      resShape, argShapes, predMode);
+
+      // Vectorize
+      IF_VERBOSE errs() << "\nVectorizing kernel \""
+                        << vectorizerJob.scalarFn->getName()
+                        << "\" into declaration \""
+                        << vectorizerJob.vectorFn->getName()
+                        << "\" with vector size " << vectorizerJob.vectorWidth
+                        << "... \n";
+
+      // vectorize and assign a mangled name (if no specific name was requested beforehand)
+      vectorizeFunction(vectorizerJob, shapeMap, !hasTargetDeclName, ulpErrorBound);
+
+    } else if (loopVecMode) {
+      vectorizeFirstLoop(*scalarFn, vectorWidth, ulpErrorBound);
     }
 
+    if (lowerIntrinsicsFunc) {
+      IF_VERBOSE errs() << "Lowering intrinsics in function "
+                        << scalarFn->getName() << "\n";
+      rv::lowerIntrinsics(*scalarFn);
+    } else if (lowerIntrinsicsMod) {
+      IF_VERBOSE errs() << "Lowering intrinsics in module\n";
+      rv::lowerIntrinsics(*mod);
+    }
+
+  } // !finish
+
+  if (OnlyAnalyze)
     return 0;
+
+  // output
+  if (hasOutFile) {
+    writeModuleToFile(mod, outFile);
+    IF_VERBOSE errs() << "Final module written to \"" << outFile << "\"\n";
+  } else {
+    mod->print(llvm::outs(), nullptr, false, true);
+  }
+
+  return 0;
 }

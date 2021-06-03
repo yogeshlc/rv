@@ -10,98 +10,230 @@
 #define NATIVE_NATBUILDER_H
 
 
+#include "MemoryAccessGrouper.h"
+
 #include <vector>
 
-#include <rv/rvInfo.h>
-#include <rv/analysis/maskAnalysis.h>
-#include <rv/vectorizationInfo.h>
+#include "rv/vectorizationInfo.h"
+#include "rv/PlatformInfo.h"
+#include "rv/config.h"
+#include "rv/intrinsics.h"
+#include "rv/analysis/UndeadMaskAnalysis.h"
 
+#include <llvm/Analysis/MemoryDependenceAnalysis.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/Transforms/Utils/ValueMapper.h>
+#include <llvm/ADT/SmallVector.h>
+
 
 namespace rv {
   class Region;
-}
+  class ReductionAnalysis;
+  class Reduction;
+  class StridePattern;
 
-namespace native {
-    typedef std::map<const llvm::Function*, const rv::VectorMapping*> VectorMappingMap;
-    typedef std::vector<llvm::Value *> LaneValueVector;
+  struct VectorizedMask {
+    llvm::Value * predicate;
+    llvm::Value * activeVectorLength;
 
-    class NatBuilder {
-        llvm::IRBuilder<> builder;
+    VectorizedMask(llvm::Value * _pred, llvm::Value * _avl)
+    : predicate(_pred)
+    , activeVectorLength(_avl)
+    {}
 
-        rv::RVInfo & rvInfo;
-        rv::VectorizationInfo &vectorizationInfo;
-        const llvm::DominatorTree &dominatorTree;
+    VectorizedMask()
+    : predicate(nullptr)
+    , activeVectorLength(nullptr)
+    {}
 
-        llvm::Type *i1Ty;
-        llvm::Type *i32Ty;
+    bool hasAllOnesPredicate() const;
+  };
 
-        rv::Region * region;
+  using ValVec = llvm::SmallVector<llvm::Value*, 16>;
 
-    public:
-        NatBuilder(rv::RVInfo & rvInfo, VectorizationInfo &vectorizationInfo, const llvm::DominatorTree &dominatorTree);
+  typedef std::map<const llvm::Function *, const rv::VectorMapping *> VectorMappingMap;
+  typedef std::vector<llvm::Value *> LaneValueVector;
+  typedef std::vector<llvm::BasicBlock *> BasicBlockVector;
 
-        void vectorize();
-        void vectorize(llvm::BasicBlock *const bb, llvm::BasicBlock *vecBlock);
-        void vectorize(llvm::Instruction *const inst);
+  class NatBuilder {
+    llvm::IRBuilder<> builder;
 
-        void copyInstruction(llvm::Instruction *const inst, unsigned laneIdx = 0);
-        void copyGEPInstruction(llvm::GetElementPtrInst *const gep, unsigned laneIdx = 0);
+    rv::Config config;
+    rv::PlatformInfo & platInfo;
+    rv::VectorizationInfo &vecInfo;
+    const llvm::DominatorTree &dominatorTree;
+    llvm::MemoryDependenceResults & memDepRes;
+    llvm::ScalarEvolution &SE;
+    rv::ReductionAnalysis & reda;
+    rv::UndeadMaskAnalysis undeadMasks;
 
-        void mapVectorValue(const llvm::Value *const value, llvm::Value *vecValue);
+    llvm::DataLayout layout;
 
-        void mapScalarValue(const llvm::Value *const value, llvm::Value *mapValue, unsigned laneIdx = 0);
+    llvm::Type *i1Ty;
+    llvm::Type *i32Ty;
+    llvm::Type *vecMaskTy;
 
-        llvm::Value *getVectorValue(llvm::Value *const value);
+    // the predicate argument in the vector function (WFV mode)
+    llvm::Value * vecMaskArg;
 
-        llvm::Value *getScalarValue(llvm::Value *const value, unsigned laneIdx = 0);
+    void printStatistics();
 
-    private:
-        void addValuesToPHINodes();
+    rv::VectorShape getVectorShape(const llvm::Value &val);
 
-        void vectorizePHIInstruction(llvm::PHINode *const scalPhi);
-        void vectorizeMemoryInstruction(llvm::Instruction *const inst);
-        void vectorizeCallInstruction(llvm::CallInst *const scalCall);
+    // get the appropriate integer ty to index into the ptr-typed \p val.
+    llvm::Type* getIndexTy(llvm::Value * val) const;
 
-        void mapOperandsInto(llvm::Instruction *const scalInst, llvm::Instruction *inst, bool vectorizedInst,
-                             unsigned laneIdx = 0);
+    // repair outside uses of redChainInst using repairFunc
+    void repairOutsideUses(llvm::Instruction & scaChainInst, std::function<llvm::Value& (llvm::Value &,llvm::BasicBlock &)> repairFunc);
 
-        llvm::DenseMap<const llvm::Value *, llvm::Value *> vectorValueMap;
-        std::map<const llvm::Value *, LaneValueVector> scalarValueMap;
-        llvm::DenseMap<unsigned, llvm::Function *> cascadeLoadMap;
-        llvm::DenseMap<unsigned, llvm::Function *> cascadeStoreMap;
-        std::vector<llvm::PHINode *> phiVector;
+    // generate reduction code (after all other instructions have been vectorized)
+    void materializeVaryingReduction(rv::Reduction & red, llvm::PHINode & scaPhi);
 
-        llvm::Value *requestVectorValue(llvm::Value *const value);
+    // materialize a recurrence pattern (SCC only consists of phis and selects)
+    void materializeRecurrence(rv::Reduction & red, llvm::PHINode & scaPhi);
 
-        llvm::Value *requestScalarValue(llvm::Value *const value, unsigned laneIdx = 0,
-                                        bool skipMappingWhenDone = false);
-        llvm::Value *requestCascadeLoad(llvm::Value *vecPtr, unsigned int alignment, llvm::Value *mask);
-        llvm::Value *requestCascadeStore(llvm::Value *vecVal, llvm::Value *vecPtr, unsigned int alignment,
-                                         llvm::Value *mask);
+    // fixup the
+    void materializeStridePattern(rv::StridePattern & sp);
 
-        llvm::Function *createCascadeMemory(llvm::VectorType *pointerVectorType, unsigned alignment,
-                                            llvm::VectorType *maskType, bool store);
+    llvm::Value& materializeVectorReduce(llvm::IRBuilder<> & builder, llvm::Value & phiInitVal, llvm::Value & vecVal, llvm::Instruction & reduceOp);
 
-        void mapCascadeFunction(unsigned bitWidth, llvm::Function *function, bool store);
+    // create a mask cascade at the current insertion point, call @genFunc in every cascaded block, if @packResult insert all values provided by @genFunc into
+    // an accumulator and return that (result size 1). If !@packResult return dominating definitions of the computed value
+    // @genFunc: first argument is an IRBuilder that inserts into a fresh mask-guarded block, second argument is the lane for which the instruction @inst should be scalarized
+    ValVec scalarizeCascaded(llvm::BasicBlock & srcBlock, llvm::Instruction & srcInst, bool packResult, std::function<llvm::Value*(llvm::IRBuilder<>&,size_t)> genFunc);
 
-        llvm::Function *getCascadeFunction(unsigned bitWidth, bool store);
+    // scalarize without if-guard
+    ValVec scalarize(llvm::BasicBlock & srcBlock, llvm::Instruction & srcInst, bool packResult, std::function<llvm::Value*(llvm::IRBuilder<>&,size_t)> genFunc);
 
-        llvm::Value *createPTest(llvm::Value *vector);
+  public:
+    NatBuilder(rv::Config config, rv::PlatformInfo &_platformInfo, rv::VectorizationInfo &_vecInfo,
+               const llvm::DominatorTree &_dominatorTree, llvm::MemoryDependenceResults &memDepRes,
+               llvm::ScalarEvolution &_SE, rv::ReductionAnalysis & _reda);
 
-        const rv::VectorMapping * getFunctionMapping(llvm::Function *func);
+    llvm::LLVMContext& getContext() const;
 
-        unsigned vectorWidth();
+    // if embedRegion is set, replace the scalar source blocks/instructions with the vectorized version
+    // if vecInstMap is set, store the mapping from scalar source insts/blocks to vector versions
+    void vectorize(bool embedRegion, llvm::ValueToValueMapTy * vecInstMap = nullptr);
 
-        bool canVectorize(llvm::Instruction *inst);
-        bool shouldVectorize(llvm::Instruction *inst);
+    void mapVectorValue(const llvm::Value *const value, llvm::Value *vecValue);
+    void mapScalarValue(const llvm::Value *const value, llvm::Value *mapValue, unsigned laneIdx = 0);
 
-        bool useMappingForCall(const rv::VectorMapping *mapping, llvm::CallInst *const scalCall);
+    llvm::Value *getVectorValue(llvm::Value *const value, bool getLastBlock = false);
+    llvm::Value *getScalarValue(llvm::Value *const value, unsigned laneIdx = 0);
+    BasicBlockVector getMappedBlocks(llvm::BasicBlock *const bb);
 
-        void vectorizeReductionCall(CallInst *wfvCall);
-    };
+  private:
+    void vectorize(llvm::BasicBlock *const bb, llvm::BasicBlock *vecBlock);
+    void vectorizeInstruction(llvm::Instruction *const inst);
+    void vectorizePHIInstruction(llvm::PHINode *const scalPhi);
+    void vectorizeMemoryInstruction(llvm::Instruction *const inst);
+    void vectorizeCallInstruction(llvm::CallInst *const scalCall);
+    void vectorizeReductionCall(llvm::CallInst *rvCall, bool isRv_all);
+    void vectorizeExtractCall(llvm::CallInst *rvCall);
+    void vectorizeInsertCall(llvm::CallInst *rvCall);
+    void vectorizeLoadCall(llvm::CallInst *rvCall);
+    void vectorizeStoreCall(llvm::CallInst *rvCall);
+    void vectorizeShuffleCall(llvm::CallInst *rvCall);
+    void vectorizeBallotCall(llvm::CallInst *rvCall);
+    void vectorizePopCountCall(llvm::CallInst *rvCall);
+    void vectorizeAlignCall(llvm::CallInst *rvCall);
+    void vectorizeIndexCall(llvm::CallInst & rvCall);
+
+    void vectorizeAlloca(llvm::AllocaInst *const allocaInst);
+    llvm::Type* vectorizeType(llvm::Type * scaTy);
+
+    // implement the mask summary function @mode (ballot/popcount) of @vecVal with @builder
+    llvm::Value* createVectorMaskSummary(llvm::Type & indexTy, llvm::Value * vecVal, llvm::IRBuilder<> & builder, rv::RVIntrinsic mode);
+
+    void copyInstruction(llvm::Instruction *const inst, unsigned laneIdx = 0);
+    void copyCallInstruction(llvm::CallInst *const scalCall, unsigned laneIdx = 0);
+
+    // "vectorize" the instruction by creating scalar replicas and inserting their results in a vector (where appropriate)
+    void replicateInstruction(llvm::Instruction *const inst);
+
+    void addValuesToPHINodes();
+    VectorizedMask
+    requestVectorizedBlockMask(llvm::BasicBlock& scaBlock);
+
+    llvm::Value*
+    requestVectorizedOperand(llvm::Instruction & scalInst, int opIdx);
+
+    void mapOperandsInto(llvm::Instruction *const scalInst, llvm::Instruction *inst, bool vectorizedInst,
+                         unsigned laneIdx = 0);
+
+    llvm::SmallPtrSet<llvm::Instruction *, 16> keepScalar;
+    llvm::DenseMap<unsigned, llvm::Function *> cascadeLoadMap;
+    llvm::DenseMap<unsigned, llvm::Function *> cascadeStoreMap;
+    llvm::DenseMap<const llvm::Value *, llvm::Value *> vectorValueMap;
+    std::map<const llvm::Value *, LaneValueVector> scalarValueMap;
+    std::map<const llvm::BasicBlock *, BasicBlockVector> basicBlockMap;
+    std::map<const llvm::Type *, rv::MemoryAccessGrouper> grouperMap;
+    std::map<const llvm::Value *, LaneValueVector> pseudointerValueMap;
+    std::vector<llvm::PHINode *> phiVector;
+    std::deque<llvm::Instruction *> lazyInstructions;
+
+    void addLazyInstruction(llvm::Instruction *const instr);
+    void requestLazyInstructions(llvm::Instruction *const upToInstruction);
+    llvm::Value* requestVectorPredicate(const llvm::BasicBlock& scaBlock);
+    llvm::Value *requestVectorValue(llvm::Value *const value);
+    llvm::Value *requestScalarValue(llvm::Value *const value, unsigned laneIdx = 0,
+                                    bool skipMapping = false);
+    llvm::Value *buildGEP(llvm::GetElementPtrInst *const gep, bool buildScalar, unsigned laneIdx);
+    llvm::Value *requestVectorGEP(llvm::GetElementPtrInst *const gep);
+    llvm::Value *requestScalarGEP(llvm::GetElementPtrInst *const gep, unsigned laneIdx, bool skipMapping);
+    llvm::Value *requestVectorBitCast(llvm::BitCastInst *const bc);
+    llvm::Value *requestScalarBitCast(llvm::BitCastInst *const bc, unsigned laneIdx, bool skipMapping);
+
+    llvm::Value *requestInterleavedGEP(llvm::GetElementPtrInst *const gep, unsigned interleavedIdx);
+    llvm::Value *requestInterleavedAddress(llvm::Value *const addr, unsigned interleavedIdx, llvm::Type *const vecType);
+
+    llvm::Value *requestCascadeLoad(llvm::Value *vecPtr, unsigned alignment, llvm::Value *mask);
+    llvm::Value *requestCascadeStore(llvm::Value *vecVal, llvm::Value *vecPtr, unsigned alignment, llvm::Value *mask);
+    llvm::Function *createCascadeMemory(llvm::VectorType *pointerVectorType, unsigned alignment,
+                                        llvm::VectorType *maskType, bool store);
+
+    void mapCascadeFunction(unsigned bitWidth, llvm::Function *function, bool store);
+    llvm::Function *getCascadeFunction(unsigned bitWidth, bool store);
+
+    llvm::Value& widenScalar(llvm::Value & scaValue, VectorShape vecShape);
+    bool hasUniformPredicate(const llvm::BasicBlock & BB) const;
+    llvm::Value *createPTest(llvm::Value *vector, bool isRv_all);
+    llvm::Value *maskInactiveLanes(llvm::Value *const value, const llvm::BasicBlock* const block, bool invert);
+
+    int vectorWidth() const;
+
+    bool canVectorize(llvm::Instruction *inst);
+    bool shouldVectorize(llvm::Instruction *inst);
+    bool isInterleaved(llvm::Instruction *inst, llvm::Value *accessedPtr, int byteSize, std::vector<llvm::Value *> &srcs);
+    bool isPseudointerleaved(llvm::Instruction *inst, llvm::Value *addr, int byteSize);
+
+    // request and return all the vector arguments for calling \p vecCall with the vector mappings for the arguments in \p scaCall. this should also include the mask (if any).
+    void requestVectorCallArgs(llvm::CallInst & scaCall, llvm::Function & vecCall, int maskPos, std::vector<llvm::Value*> & vectorArgs);
+
+    // a varying value is stored to a uniform ptr (under a predicate)
+    llvm::Value *createVaryingToUniformStore(llvm::Instruction *inst, llvm::Type *accessedType, unsigned int alignment, llvm::Value *addr, VectorizedMask mask, llvm::Value *values);
+
+    // guard the code generated by @genFunc in a rv_any(ptest) on the predicate (if required).
+    // if (p) { %phi = <genFunc> };
+    // this will omit the guard if \p instNeedsGuard is false.
+    llvm::Value &createAnyGuard(bool instNeedsGuard, llvm::BasicBlock & srcBlock, llvm::Instruction & inst, bool producesValue, std::function<llvm::Value*(llvm::IRBuilder<>&)> genFunc);
+
+    // a uniform value is stored to a uniform ptr (with a predicate)
+    llvm::Value *createUniformMaskedMemory(llvm::Instruction *inst, llvm::Type *accessedType, unsigned alignment,
+                                           llvm::Value *addr, llvm::Value * scalarMask, VectorizedMask vectorMask, llvm::Value *values);
+
+    llvm::Value *createVaryingMemory(llvm::Type *vecType, unsigned alignment, llvm::Value *addr, VectorizedMask mask,
+                                     llvm::Value *values);
+    llvm::Value *createContiguousStore(llvm::Value *val, llvm::Value *ptr, unsigned alignment, VectorizedMask mask);
+    llvm::Value *createContiguousLoad(llvm::Value *ptr, unsigned alignment, VectorizedMask mask, llvm::Value *passThru);
+
+    void visitMemInstructions();
+
+
+  };
 }
 
 #endif //NATIVE_NATBUILDER_H

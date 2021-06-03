@@ -14,17 +14,35 @@
 #include <llvm/IR/Value.h>
 
 #include <vector>
+#include <rv/PlatformInfo.h>
+#include <llvm/IR/IRBuilder.h>
 
 llvm::Type *getVectorType(llvm::Type *type, unsigned width);
 
-llvm::Value *createContiguousVector(unsigned width, llvm::Type *type, int start = 0);
+llvm::Value *createContiguousVector(unsigned width, llvm::Type *type, int start, int stride);
 
-/***
- * Create blocks needed for an if-cascade. Condition blocks are inserted into condBlocks, the masked blocks into
- * maskedBlocks. Pointer to return block is returned.
- */
+llvm::Value *getConstantVector(unsigned width, llvm::Type *type, unsigned value);
+llvm::Value *getConstantVector(unsigned width, llvm::Constant *constant);
+llvm::Value *getConstantVectorPadded(unsigned width, llvm::Type *type, std::vector<unsigned> &values, bool padWithZero = false);
+
+llvm::Value *getPointerOperand(llvm::Instruction *instr);
+llvm::Value *getBasePointer(llvm::Value *addr);
+
+
 llvm::BasicBlock *createCascadeBlocks(llvm::Function *insertInto, unsigned vectorWidth,
                                       std::vector<llvm::BasicBlock *> &condBlocks,
                                       std::vector<llvm::BasicBlock *> &maskedBlocks);
+
+bool isSupportedOperation(llvm::Instruction *const inst);
+
+bool isHomogeneousStruct(llvm::StructType *const type, llvm::DataLayout &layout);
+
+llvm::StructType * isStructAccess(llvm::Value *const address);
+llvm::StructType * containsStruct(llvm::Type *const type);
+
+unsigned getNumLeafElements(llvm::Type *const type, llvm::Type *const leafType, llvm::DataLayout &layout);
+unsigned getStructOffset(llvm::GetElementPtrInst *const gep);
+
+void setInsertionToDomBlockEnd(llvm::IRBuilder<> &builder, std::vector<llvm::BasicBlock *> &blocks);
 
 #endif //NATIVE_UTILS_H

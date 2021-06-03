@@ -28,71 +28,15 @@
 
 
 //----------------------------------------------------------------------------//
-// RegionVectorizer configuration defines
-// These should be set by the build script
-//----------------------------------------------------------------------------//
-
-// Enable silent mode (no output at all)
-// (default: deactivated)
-//#define RV_SILENT_MODE
-
-// Ignore alignment analysis and only generate aligned loads/stores.
-// This may lead to segmentation faults.
-// (default: deactivated)
-//#define RV_FORCE_ALIGNED_MEMOPS
-
-// Ignore alignment analysis and only generate unaligned loads/stores.
-// (default: deactivated)
-//#define RV_FORCE_UNALIGNED_MEMOPS
-
-#ifndef RV_RVLIB_FILE
-#   error "Path to RV library file (native SSE sin, cos, etc.) not supplied via build script!"
-#endif
-
-
-//----------------------------------------------------------------------------//
 // debug flags
 //----------------------------------------------------------------------------//
 
-//if NDEBUG is defined, always ignore debug information
-#ifdef NDEBUG
-#   undef _DEBUG
-#endif
-
-// global debug flag
-#ifdef _DEBUG
-extern bool rvVerbose;
-#endif
-
-// debug macros
-// do while and ((void)0) are used to enforce semicolon
-// DEBUG_RV_VISIBLE allows arbitrary code that does not have its own scope
-// NOTE: a boolean 'mVerbose' has to be in scope in order to use this ;)
-#ifdef _DEBUG
-#   define DEBUG_RV_NO_VERBOSE(x) do { x } while (0)
-#   define DEBUG_RV(x) if (rvVerbose) { x }
-#   define DEBUG_RV_VISIBLE(x) x ((void)0)
-#   define IF_VERBOSE if (rvVerbose)
+#ifdef RV_DEBUG
+#   define IF_VERBOSE if (true)
 #   define IF_DEBUG if (true)
 #else
-#   define DEBUG_RV_NO_VERBOSE(x) ((void)0)
-#   define DEBUG_RV(x) ((void)0)
-#   define DEBUG_RV_VISIBLE(x) ((void)0)
 #   define IF_VERBOSE if (false)
 #   define IF_DEBUG if (false)
-#endif
-
-// VectorizationAnalysis should remain independent of RVInfo, so the verbose flag is
-// stored separately
-#ifdef _DEBUG
-#   define DEBUG_VA_NO_VERBOSE(x) do { x } while (0)
-// #   define DEBUG_VA(x) if (true) { x } // be quiet
-#   define DEBUG_VA(x) ((void)0)
-#   define DEBUG_VA_VISIBLE(x) x ((void)0)
-#else
-#   define DEBUG_VA_NO_VERBOSE(x) ((void)0)
-#   define DEBUG_VA(x) ((void)0)
-#   define DEBUG_VA_VISIBLE(x) ((void)0)
 #endif
 
 //----------------------------------------------------------------------------//
@@ -102,10 +46,6 @@ extern bool rvVerbose;
 // Use this macro to silence warnings for variables that are
 // only used in assertions.
 #define RV_UNUSED(x) ((void)(x))
-
-
-// use ShuffleInsts to broadcast operands
-// #define RV_USE_SHUFFLE_BROADCAST
 
 
 #endif // _RVCONFIG_H

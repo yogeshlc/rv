@@ -9,383 +9,364 @@
 //
 
 #include <llvm/Transforms/Utils/Cloning.h>
-#include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/LegacyPassManager.h>
+
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/Analysis/PostDominators.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Analysis/MemoryDependenceAnalysis.h>
+#include <llvm/Analysis/BranchProbabilityInfo.h>
 
-#include <rv/rv.h>
-#include <rv/pda/ProgramDependenceAnalysis.h>
-#include <rv/pda/DFG.h>
-#include <rv/analysis/maskAnalysis.h>
-#include <rv/analysis/MetadataMaskAnalyzer.h>
-#include <rv/transforms/maskGenerator.h>
-#include <rv/transforms/cfgLinearizer.h>
-#include <rv/analysis/vectorizationAnalysis.h>
-#include <rv/transforms/selectGenerator.h>
-#include <rv/transforms/loopExitCanonicalizer.h>
-#include <rv/pda/ABAAnalysis.h>
+#include "rv/rv.h"
+#include "rv/analysis/VectorizationAnalysis.h"
+#include "rv/intrinsics.h"
 
-#include <native/nativeBackendPass.h>
-#include <native/NatBuilder.h>
+#include "rv/transform/loopExitCanonicalizer.h"
+#include "rv/transform/divLoopTrans.h"
 
-#include "utils/metadata.h"
+#include "rv/PlatformInfo.h"
+#include "rv/vectorizationInfo.h"
+#include "rv/analysis/reductionAnalysis.h"
+
+#include "rv/transform/Linearizer.h"
+
+#include "rv/transform/splitAllocas.h"
+#include "rv/transform/structOpt.h"
+#include "rv/transform/srovTransform.h"
+#include "rv/transform/irPolisher.h"
+#include "rv/transform/bosccTransform.h"
+#include "rv/transform/redOpt.h"
+#include "rv/transform/memCopyElision.h"
+#include "rv/transform/lowerDivergentSwitches.h"
+
+#include "native/NatBuilder.h"
+
+#include "utils/rvTools.h"
 
 #include "rvConfig.h"
+#include "report.h"
+
+#include "rv/transform/maskExpander.h"
+
+#include "rv/transform/crtLowering.h"
 
 
-namespace {
-void removeTempFunction(Module* mod, const std::string& name)
-{
-    assert (mod);
-    if (Function* tmpFn = mod->getFunction(name))
-    {
-        assert (tmpFn->use_empty());
-        tmpFn->eraseFromParent();
+using namespace llvm;
+
+namespace rv {
+
+VectorizerInterface::VectorizerInterface(PlatformInfo & _platInfo, Config _config)
+        : config(_config)
+        , platInfo(_platInfo)
+{ }
+
+static void
+EmbedInlinedCode(BasicBlock & entry, Loop & hostLoop, LoopInfo & loopInfo, std::set<BasicBlock*> & funcBlocks) {
+  for (auto itSucc : successors(&entry)) {
+    auto & succ = *itSucc;
+
+    // block was newly inserted -> embed in loopInfo
+    if (funcBlocks.insert(&succ).second) {
+      hostLoop.addBasicBlockToLoop(&succ, loopInfo);
+      EmbedInlinedCode(succ, hostLoop, loopInfo, funcBlocks);
     }
+  }
 }
+
+#define IF_DEBUG_CRT IF_DEBUG
 
 void
-removeUnusedRVLibFunctions(Module* mod)
+VectorizerInterface::lowerRuntimeCalls(VectorizationInfo & vecInfo, LoopInfo & loopInfo)
 {
-#define REMOVE_LIB_FN(name) \
-    { \
-        Function* fn = mod->getFunction(#name); \
-        if (fn && fn->use_empty()) \
-        { \
-            fn->eraseFromParent(); \
-        } \
-    } \
-    ((void)0)
+  auto & scalarFn = vecInfo.getScalarFunction();
+  auto & mod = *scalarFn.getParent();
 
-    REMOVE_LIB_FN(log2_ps);
-    REMOVE_LIB_FN(exp2_ps);
-    REMOVE_LIB_FN(log_ps);
-    REMOVE_LIB_FN(exp_ps);
-    REMOVE_LIB_FN(sin_ps);
-    REMOVE_LIB_FN(cos_ps);
-    REMOVE_LIB_FN(sincos_ps);
-    REMOVE_LIB_FN(fabs_ps);
-    REMOVE_LIB_FN(pow_ps);
-    REMOVE_LIB_FN(log2256_ps);
-    REMOVE_LIB_FN(exp2256_ps);
-    REMOVE_LIB_FN(log256_ps);
-    REMOVE_LIB_FN(exp256_ps);
-    REMOVE_LIB_FN(sin256_ps);
-    REMOVE_LIB_FN(cos256_ps);
-    REMOVE_LIB_FN(sincos256_ps);
-    REMOVE_LIB_FN(fabs256_ps);
-    REMOVE_LIB_FN(pow256_ps);
+  std::vector<CallInst*> callSites;
 
-#undef REMOVE_LIB_FN
-}
-}
+  // blocks that are known to be in the function
+  std::set<BasicBlock*> funcBlocks;
+  for (auto & BB : scalarFn) {
+    funcBlocks.insert(&BB);
+  }
 
-VectorizerInterface::VectorizerInterface(RVInfo& rvInfo, Function* scalarCopy)
-        : mInfo(rvInfo), mScalarFn(scalarCopy)
-{
-    const Function& scalarFunction = *rvInfo.mScalarFunction;
-    const Function& simdFunction = *rvInfo.mSimdFunction;
-    const std::string& scalarName = scalarFunction.getName();
-    const std::string& simdName = simdFunction.getName();
+  for (auto & BB : scalarFn) {
+    if (!vecInfo.inRegion(BB)) continue;
 
-    if (&scalarFunction != &simdFunction) {
-      if (scalarFunction.isVarArg())
-      {
-          throw std::logic_error("ERROR while vectorizing function in module '"
-          + mInfo.mModule->getModuleIdentifier() + "': function '"
-          + scalarName + "' has a variable argument list (not supported)!");
-      }
+    for (auto & Inst : BB) {
+      auto * call = dyn_cast<CallInst>(&Inst);
+      if (!call) continue;
+      auto * callee = dyn_cast<Function>(call->getCalledValue());
+      if (!callee) continue;
+      if (callee->isIntrinsic() || !callee->isDeclaration()) continue;
 
-      if (scalarFunction.isDeclaration())
-      {
-          throw std::logic_error("ERROR while vectorizing function in module '"
-          + mInfo.mModule->getModuleIdentifier() + "': scalar source function '"
-          + scalarName + "' has no body!");
-      }
+      Function * implFunc = requestScalarImplementation(callee->getName(), *callee->getFunctionType(), mod);
+      IF_DEBUG_CRT { if (!implFunc) errs() << "CRT: could not find implementation for " << callee->getName() << "\n"; }
 
-      if (!simdFunction.isDeclaration())
-      {
-          assert (!simdFunction.getBasicBlockList().empty() &&
-                  "Function is no declaration but does not have basic blocks?!");
-          throw std::logic_error("ERROR while vectorizing function in module '"
-          + mInfo.mModule->getModuleIdentifier() + "': extern target function '"
-          + simdName + "' must not have a body!");
-      }
+      if (!implFunc) continue;
 
-      if (!verifyFunctionSignaturesMatch(*mScalarFn, simdFunction))
-      {
-          throw std::logic_error("ERROR: Function signatures do not match!\n");
+      IF_DEBUG_CRT { errs() << "CRT: implementing " << callee->getName() << " with " << implFunc->getName() << "\n"; }
+
+      // replaced called function and prepare for inlining
+      auto itStart = callee->use_begin();
+      auto itEnd = callee->use_end();
+      for (auto itUse = itStart; itUse != itEnd; ) {
+        auto & userInst = *itUse->getUser();
+        itUse++;
+        auto * caller = dyn_cast<CallInst>(&userInst);
+        if (!caller) continue;
+        if (!vecInfo.inRegion(*caller->getParent())) continue;
+        callSites.push_back(caller);
+        caller->setCalledFunction(implFunc);
       }
     }
+  }
 
-    IF_DEBUG {
-      scalarFunction.print(outs());
-      rv::writeFunctionToFile(scalarFunction, scalarName+".ll");
-      rv::writeModuleToFile(*mInfo.mModule, scalarName+".mod.ll");
-      verifyFunction(scalarFunction);
+  // TODO repair loopInfo
 
-      simdFunction.print(outs());
-    }
+  // FIXME this invalidates loop info and thus the region
+  for (auto * call : callSites) {
+    auto & entryBB = *call->getParent();
+    auto * hostLoop = loopInfo.getLoopFor(&entryBB);
+    InlineFunctionInfo IFI;
+    InlineFunction(call, IFI);
 
-    mInfo.configure();
-    rv::setUpMetadata(mInfo.mModule);
-
-    addPredicateInstrinsics();
+    if (hostLoop) EmbedInlinedCode(entryBB, *hostLoop, loopInfo, funcBlocks);
+  }
 }
 
-/* VectorizerInterface::~VectorizerInterface()
-{
-    // Delete the copy
-    delete mScalarFn;
-}*/
-
-bool
-VectorizerInterface::addSIMDSemantics(const Function& f,
-                                      const bool      isOpUniform,
-                                      const bool      isOpVarying,
-                                      const bool      isOpSequential,
-                                      const bool      isOpSequentialGuarded,
-                                      const bool      isResultUniform,
-                                      const bool      isResultVector,
-                                      const bool      isResultScalars,
-                                      const bool      isAligned,
-                                      const bool      isIndexSame,
-                                      const bool      isIndexConsecutive)
-{
-    // We also map the function to itself so that instruction vectorization
-    // "knows" it and replaces it by itself.
-    const bool mayHaveSideEffects = !isOpUniform && !isResultUniform;
-    mInfo.addSIMDMapping(f, f, -1, mayHaveSideEffects);
-
-    return mInfo.addSIMDSemantics(f,
-                                  isOpUniform,
-                                  isOpVarying,
-                                  isOpSequential,
-                                  isOpSequentialGuarded,
-                                  isResultUniform,
-                                  isResultVector,
-                                  isResultScalars,
-                                  isAligned,
-                                  isIndexSame,
-                                  isIndexConsecutive);
-}
 
 void
-VectorizerInterface::addPredicateInstrinsics() {
-    FunctionType * simdPredTy = FunctionType::get(mInfo.mScalarBoolTy, ArrayRef<Type*>(mInfo.mVectorTyBoolSIMD), false);
-    IF_DEBUG errs() << "SIMD Mapping for mask intrinsic: " << *simdPredTy << "\n";
-    for (Function & func : *mInfo.mModule) {
-        bool isMaskPredicate = false;
-        if (func.getName() == "rv_any") {
-            isMaskPredicate = true;
-            // Function * anySimdFunc = cast<Function>(mInfo->mModule->getOrInsertFunction("rv_any_simd", simdPredTy));
-            // addSIMDMapping(func, *anySimdFunc, -1, false);
-        } else if ((func.getName() == "rv_all")) {
-            isMaskPredicate = true;
-            // Function * allSimdFunc = cast<Function>(mInfo->mModule->getOrInsertFunction("rv_all_simd", simdPredTy));
-            // addSIMDMapping(func, *allSimdFunc, -1, false);
-        }
-
-        if (isMaskPredicate) {
-            addSIMDSemantics(func,
-                             true, // isOpUniform
-                             false,// isOpVarying
-                             false,// isOpSequential
-                             false,// isOpSequentialGuarded
-                             true, // isResultUniform
-                             false,// isResultVector
-                             false,// isResultScalars
-                             true, // isAligned
-                             true, // isIndexSame
-                             false // isIndexConsecutive
-            );
-        }
-    }
-}
-
-bool
-VectorizerInterface::verifyVectorizedType(Type* scalarType, Type* vecType)
-{
-    // Check for uniform equivalence.
-    if (scalarType == vecType) return true;
-    if (rv::typesMatch(scalarType, vecType)) return true;
-
-    // Check for varying equivalence.
-    Type* vectorizedType = rv::vectorizeSIMDType(scalarType, mInfo.mVectorizationFactor);
-    if (rv::typesMatch(vecType, vectorizedType)) return true;
-
-    return false;
-}
-
-bool
-VectorizerInterface::verifyFunctionSignaturesMatch(const Function& f,
-                                                   const Function& f_SIMD)
-{
-    if (f.arg_size() != f_SIMD.arg_size())
-    {
-        errs() << "ERROR: number of function arguments does not match!\n";
-        return false;
-    }
-
-    // check argument and return types
-    Type* scalarReturnType      = f.getReturnType();
-    Type* foundVectorReturnType = f_SIMD.getReturnType();
-
-    if (!verifyVectorizedType(scalarReturnType, foundVectorReturnType))
-    {
-        errs()
-        << "ERROR: return type does not match!\n"
-        << "       scalar      : " << *scalarReturnType << "\n"
-        << "       vec found   : " << *foundVectorReturnType << "\n";
-        return false;
-    }
-
-    for (auto A = f.arg_begin(), extA = f_SIMD.arg_begin();
-         A != f.arg_end() && extA != f_SIMD.arg_end();
-         ++A, ++extA)
-    {
-        Type* scalarType = A->getType();
-        Type* foundVectorType = extA->getType();
-
-        if (!verifyVectorizedType(scalarType, foundVectorType))
-        {
-            errs()
-            << "ERROR: argument type does not match: " << *A << "\n"
-            << "       scalar      : " << *scalarType << "\n"
-            << "       vec found   : " << *foundVectorType << "\n";
-            return false;
-        }
-    }
-
-    return true;
-}
-
-void
-VectorizerInterface::analyze(VectorizationInfo& vectorizationInfo,
-                             const CDG& cdg,
-                             const DFG& dfg,
-                             const LoopInfo& loopInfo,
+VectorizerInterface::analyze(VectorizationInfo& vecInfo,
+                             const DominatorTree & domTree,
                              const PostDominatorTree& postDomTree,
-                             const DominatorTree& domTree)
+                             const LoopInfo& loopInfo)
 {
-    MetadataMaskAnalyzer maskAnalyzer(vectorizationInfo);
+    IF_DEBUG {
+      errs() << "Initial PlatformInfo:\n";
+      platInfo.dump();
 
-    PDA programDependenceAnalysis(vectorizationInfo,
-                                  cdg,
-                                  dfg,
-                                  mInfo.getVectorFuncMap(),
-                                  loopInfo);
-
-    ABAAnalysis abaAnalysis(vectorizationInfo,
-                            mInfo.getVectorFuncMap(),
-                            loopInfo,
-                            postDomTree,
-                            domTree);
-
-    programDependenceAnalysis.analyze(*mScalarFn);
-    abaAnalysis.analyze(*mScalarFn);
-    maskAnalyzer.markMasks(*mScalarFn);
-}
-
-MaskAnalysis*
-VectorizerInterface::analyzeMasks(VectorizationInfo& vectorizationInfo, const LoopInfo& loopinfo)
-{
-    MaskAnalysis* maskAnalysis = new MaskAnalysis(vectorizationInfo, mInfo, loopinfo);
-    maskAnalysis->analyze(*mScalarFn);
-    return maskAnalysis;
-}
-
-bool
-VectorizerInterface::generateMasks(VectorizationInfo& vectorizationInfo,
-                                   MaskAnalysis& maskAnalysis,
-                                   const LoopInfo& loopInfo)
-{
-    MaskGenerator maskgenerator(mInfo, vectorizationInfo, maskAnalysis, loopInfo);
-    return maskgenerator.generate(*mScalarFn);
-}
-
-bool
-VectorizerInterface::linearizeCFG(VectorizationInfo& vectorizationInfo,
-                                  MaskAnalysis& maskAnalysis,
-                                  LoopInfo& loopInfo,
-                                  const PostDominatorTree& postDomTree,
-                                  const DominatorTree& domTree)
-{
-    LoopLiveValueAnalysis loopLiveValueAnalysis(mInfo,
-                                                loopInfo);
-
-    SelectGenerator selectgenerator(mInfo,
-                                    loopInfo,
-                                    maskAnalysis,
-                                    loopLiveValueAnalysis,
-                                    vectorizationInfo);
-    CFGLinearizer linearizer(mInfo,
-                             loopInfo,
-                             maskAnalysis,
-                             loopLiveValueAnalysis,
-                             vectorizationInfo,
-                             postDomTree,
-                             domTree);
-
-    loopLiveValueAnalysis.run(*mScalarFn);
-    selectgenerator.generate(*mScalarFn);
-    linearizer.linearize(*mScalarFn);
-
-    return true;
-}
-
-bool
-VectorizerInterface::vectorize(VectorizationInfo& vecInfo, const DominatorTree& domTree)
-{
-    // Strip legacy metadata calls
-    std::vector<Instruction *> killList;
-    for (auto &block : *vecInfo.getMapping().scalarFn) {
-        for (auto &inst : block) {
-            auto *call = dyn_cast<CallInst>(&inst);
-            if (!call) continue;
-            auto *callee = call->getCalledFunction();
-            if (!callee) continue;
-            if (callee->getName() == "rvMetadataFn") {
-                killList.push_back(call);
-            }
-        }
+      errs() << "VA before analysis:\n";
+      vecInfo.dump();
     }
-    for (auto *inst : killList) inst->eraseFromParent();
 
-    // vectorize with native
-    native::NatBuilder natBuilder(mInfo, vecInfo, domTree);
-    natBuilder.vectorize();
+    // determines value and control shapes
+    VectorizationAnalysis vea(config, platInfo, vecInfo, domTree, postDomTree, loopInfo);
+    vea.analyze();
+}
+
+bool
+VectorizerInterface::linearize(VectorizationInfo& vecInfo,
+                 DominatorTree& domTree,
+                 PostDominatorTree& postDomTree,
+                 LoopInfo& loopInfo,
+                 BranchProbabilityInfo * pbInfo)
+{
+    // use a fresh domtree here
+    // DominatorTree fixedDomTree(vecInfo.getScalarFunction()); // FIXME someone upstream broke the domtree
+    domTree.recalculate(vecInfo.getScalarFunction());
+
+    // early lowering of divergent switch statements
+    LowerDivergentSwitches divSwitchTrans(vecInfo, loopInfo);
+    if (divSwitchTrans.run()) {
+      postDomTree.recalculate(vecInfo.getScalarFunction()); // FIXME
+      domTree.recalculate(vecInfo.getScalarFunction()); // FIXME
+    }
+
+    // lazy mask generator
+    MaskExpander maskEx(vecInfo, domTree, postDomTree, loopInfo);
+
+    // convert divergent loops inside the region to uniform loops
+    DivLoopTrans divLoopTrans(platInfo, vecInfo, maskEx, domTree, loopInfo);
+    divLoopTrans.transformDivergentLoops();
+
+    postDomTree.recalculate(vecInfo.getScalarFunction()); // FIXME
+    domTree.recalculate(vecInfo.getScalarFunction()); // FIXME
+
+    // insert BOSCC branches if desired
+    if (config.enableHeuristicBOSCC) {
+      BOSCCTransform bosccTrans(vecInfo, platInfo, maskEx, domTree, postDomTree, loopInfo, pbInfo);
+      bosccTrans.run();
+    }
+    // expand masks after BOSCC
+    maskEx.expandRegionMasks();
+
+    postDomTree.recalculate(vecInfo.getScalarFunction()); // FIXME
+    domTree.recalculate(vecInfo.getScalarFunction()); // FIXME
+
+    IF_DEBUG {
+      errs() << "--- VecInfo before Linearizer ---\n";
+      vecInfo.dump();
+    }
+
+    // FIXME use external reduction analysis result (if available)
+    ReductionAnalysis reda(vecInfo.getScalarFunction(), loopInfo);
+    auto * hostLoop = loopInfo.getLoopFor(&vecInfo.getEntry());
+    if (hostLoop) reda.analyze(*hostLoop);
+
+    // optimize reduction data flow
+    ReductionOptimization redOpt(vecInfo, reda, domTree);
+    redOpt.run();
+
+    // partially linearize acyclic control in the region
+    Linearizer linearizer(vecInfo, maskEx, domTree, loopInfo);
+    linearizer.run();
+
+    IF_DEBUG {
+      errs() << "--- VecInfo after Linearizer ---\n";
+      vecInfo.dump();
+    }
 
     return true;
+}
+
+bool
+VectorizerInterface::vectorize(VectorizationInfo &vecInfo, DominatorTree &domTree, LoopInfo & loopInfo, ScalarEvolution & SE, MemoryDependenceResults & MDR, ValueToValueMapTy * vecInstMap) {
+  // divergent memcpy lowering
+  MemCopyElision mce(platInfo, vecInfo);
+  mce.run();
+
+  // split structural allocas
+  if (config.enableSplitAllocas) {
+    SplitAllocas split(vecInfo);
+    split.run();
+  } else {
+    Report() << "Split allocas opt disabled (RV_DISABLE_SPLITALLOCAS != 0)\n";
+  }
+
+  // transform allocas from Array-of-struct into Struct-of-vector where possibe
+  if (config.enableStructOpt) {
+    StructOpt sopt(vecInfo, platInfo.getDataLayout());
+    sopt.run();
+  } else {
+    Report() << "Struct opt disabled (RV_DISABLE_STRUCTOPT != 0)\n";
+  }
+
+  // Scalar-Replication-Of-Varying-(Aggregates): split up structs of vectorizable elements to promote use of vector registers
+  if (config.enableSROV) {
+    SROVTransform srovTransform(vecInfo, platInfo);
+    srovTransform.run();
+  } else {
+    Report() << "SROV opt disabled (RV_DISABLE_SROV != 0)\n";
+  }
+
+  auto * hostLoop = loopInfo.getLoopFor(&vecInfo.getEntry());
+  ReductionAnalysis reda(vecInfo.getScalarFunction(), loopInfo);
+  if (hostLoop) reda.analyze(*hostLoop);
+
+// vectorize with native
+  NatBuilder natBuilder(config, platInfo, vecInfo, domTree, MDR, SE, reda);
+  natBuilder.vectorize(true, vecInstMap);
+
+  // IR Polish phase: promote i1 vectors and perform early instruction (read: intrinsic) selection
+  if (config.enableIRPolish) {
+    IRPolisher polisher(vecInfo.getVectorFunction(), config);
+    polisher.polish();
+    Report() << "IR Polisher enabled (RV_ENABLE_POLISH != 0)\n";
+  }
+
+  IF_DEBUG verifyFunction(vecInfo.getVectorFunction());
+
+  return true;
 }
 
 void
-VectorizerInterface::finalize()
-{
-    const auto & scalarName = mScalarFn->getName();
-
-    Function* finalFn = mInfo.mSimdFunction;
-
-    assert (finalFn);
-    assert (!finalFn->isDeclaration());
-    rv::removeAllMetadata(mScalarFn);
-
-    rv::removeAllMetadata(finalFn);
-    IF_DEBUG {
-      rv::writeFunctionToFile(*finalFn, (finalFn->getName() + ".ll").str());
-    }
-    // Remove all functions that were linked in but are not used.
-    // TODO: This is a very bad temporary hack to get the "noise" project
-    //       running. We should add functions lazily.
-    removeUnusedRVLibFunctions(mInfo.mModule);
-
-    // Remove temporary functions if inserted during mask generation.
-    removeTempFunction(mInfo.mModule, "entryMaskUseFn");
-    removeTempFunction(mInfo.mModule, "entryMaskUseFnSIMD");
-
-    IF_DEBUG {
-            outs() << "### Whole-Function Vectorization of function '" << scalarName
-            << "' SUCCESSFUL!\n";
-    }
+VectorizerInterface::finalize() {
+  // TODO strip finalize
 }
 
+template <typename Impl>
+static void lowerIntrinsicCall(CallInst* call, Impl impl) {
+  call->replaceAllUsesWith(impl(call));
+  call->eraseFromParent();
+}
+
+static void
+lowerIntrinsicCall(CallInst* call) {
+  switch (GetIntrinsicID(*call)) {
+    case RVIntrinsic::Any:
+    case RVIntrinsic::All:
+    case RVIntrinsic::Extract:
+    case RVIntrinsic::Shuffle:
+    case RVIntrinsic::Align: {
+      lowerIntrinsicCall(call, [] (const CallInst* call) {
+        return call->getOperand(0);
+      });
+    } break;
+
+    case RVIntrinsic::Insert: {
+      lowerIntrinsicCall(call, [] (const CallInst* call) {
+        return call->getOperand(2);
+      });
+    } break;
+
+    case RVIntrinsic::VecLoad: {
+    lowerIntrinsicCall(call, [] (CallInst* call) {
+      IRBuilder<> builder(call);
+      auto * ptrTy = PointerType::get(builder.getFloatTy(), call->getOperand(0)->getType()->getPointerAddressSpace());
+      auto * ptrCast = builder.CreatePointerCast(call->getOperand(0), ptrTy);
+      auto * gep = builder.CreateGEP(ptrCast, { call->getOperand(1) });
+      return builder.CreateLoad(gep);
+    });
+                               } break;
+
+    case RVIntrinsic::VecStore: {
+    lowerIntrinsicCall(call, [] (CallInst* call) {
+      IRBuilder<> builder(call);
+      auto * ptrTy = PointerType::get(builder.getFloatTy(), call->getOperand(0)->getType()->getPointerAddressSpace());
+      auto * ptrCast = builder.CreatePointerCast(call->getOperand(0), ptrTy);
+      auto * gep = builder.CreateGEP(ptrCast, { call->getOperand(1) });
+      return builder.CreateStore(call->getOperand(2), gep);
+    });
+  } break;
+
+    case RVIntrinsic::Ballot:
+    case RVIntrinsic::PopCount: {
+      lowerIntrinsicCall(call, [] (CallInst* call) {
+        IRBuilder<> builder(call);
+        return builder.CreateZExt(call->getOperand(0), call->getType());
+      });
+    } break;
+  default: break;
+  }
+}
+
+void
+lowerIntrinsics(Module & mod) {
+  // TODO re-implement using RVIntrinsic enum
+  const char* names[] = {"rv_any", "rv_all", "rv_extract", "rv_insert", "rv_load", "rv_store", "rv_shuffle", "rv_ballot", "rv_align", "rv_popcount"};
+  for (int i = 0, n = sizeof(names) / sizeof(names[0]); i < n; i++) {
+    auto func = mod.getFunction(names[i]);
+    if (!func) continue;
+
+    for (
+      auto itUse = func->use_begin();
+      itUse != func->use_end();
+      itUse = func->use_begin())
+    {
+      auto *user = itUse->getUser();
+
+      if (!isa<CallInst>(user)) {
+        errs() << "Non Call: " << *user << "\n";
+      }
+
+      lowerIntrinsicCall(cast<CallInst>(user));
+    }
+  }
+}
+
+void
+lowerIntrinsics(Function & func) {
+  for (auto & block : func) {
+    BasicBlock::iterator itStart = block.begin(), itEnd = block.end();
+    for (BasicBlock::iterator it = itStart; it != itEnd; ) {
+      auto * inst = &*it++;
+      auto * call = dyn_cast<CallInst>(inst);
+      if (call) lowerIntrinsicCall(call);
+    }
+  }
+}
+
+
+
+} // namespace rv

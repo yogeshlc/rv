@@ -1,155 +1,156 @@
-FIND_PACKAGE(LLVM 3.8 REQUIRED)
+set(LLVM_NO_RTTI 1)
 
-SET ( LLVM_34_BUILD LLVM_VERSION_MAJOR GREATER 2 AND LLVM_VERSION_MINOR LESS 5 )
+set(RV_HEADER_FILES)
+if (MSVC_IDE OR XCODE)
+  file(GLOB_RECURSE RV_HEADER_FILES "${RV_SOURCE_DIR}/include/rv/**/*.h")
+endif ()
 
-SET ( RV_LIB_PATH "${CMAKE_BINARY_DIR}/rvlib.bc" CACHE FILEPATH "Wfv libary path" )
-SET ( RV_LIB_DIR "${PROJ_ROOT_DIR}/rvlibsrc" )
-SET ( RV_LIB_MATH_DIR "${RV_LIB_DIR}/mathfun" )
+if (RV_ENABLE_X86)
+  add_definitions( "-DRV_ENABLE_X86" )
+ENDIF()
 
-# pre-compilation setup
-ADD_DEFINITIONS ( ${LLVM_DEFINITIONS} )
-SET ( LLVM_PLATFORM_TOOLS_PATH ${LLVM_TOOLS_BINARY_DIR})
-# FIND_PATH ( LLVM_PLATFORM_TOOLS_PATH NAMES clang clang.exe PATHS ${LLVM_TOOLS_BINARY_DIR} ${LLVM_TOOLS_BINARY_DIR}/Debug ${LLVM_TOOLS_BINARY_DIR}/Release )
-MESSAGE ( STATUS "LLVM Tools path found: ${LLVM_PLATFORM_TOOLS_PATH}" )
-SET ( LLVM_TOOL_OPT "${LLVM_PLATFORM_TOOLS_PATH}/opt" )
-SET ( LLVM_TOOL_LINK "${LLVM_PLATFORM_TOOLS_PATH}/llvm-link" )
-SET ( LLVM_TOOL_LLVMAS "${LLVM_PLATFORM_TOOLS_PATH}/llvm-as" )
-SET ( LLVM_TOOL_CLANG "${LLVM_PLATFORM_TOOLS_PATH}/clang" )
-SET ( LLVM_TOOL_CLANGPP "${LLVM_PLATFORM_TOOLS_PATH}/clang++" )
+if (RV_ENABLE_ADVSIMD)
+  add_definitions( "-DRV_ENABLE_ADVSIMD" )
+endif()
 
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -D_DEBUG")
+if (RV_ENABLE_SLEEF) 
+  add_definitions( "-DRV_ENABLE_BUILTINS" )
+  if (RV_ENABLE_CRT)
+    add_definitions( "-DRV_ENABLE_CRT" )
+  endif()
+endif()
 
-# setup additional lib definition
-ADD_DEFINITIONS ( "-DRV_RVLIB_FILE=\"${RV_LIB_PATH}\"" )
+if (RV_ENABLE_VP)
+  Message("-- rv: Use the LLVM-VP extension (experimental)")
+  add_definitions( "-DLLVM_HAVE_VP" )
+endif()
 
-# this defaults to no-rtti builds, if this flag is not available
-IF (LLVM_ENABLE_RTTI)
-	ADD_DEFINITIONS( "-frtti" )
-ELSE ()
-	ADD_DEFINITIONS( "-fno-rtti" )
-ENDIF ()
+if (RV_DEBUG) 
+  add_definitions( "-DRV_DEBUG" )
+endif()
 
-ADD_DEFINITIONS ( "-std=c++11" )
+add_rv_library(RV
+  annotations.cpp
+  PlatformInfo.cpp
+  VectorizationInfoProxyPass.cpp
+  analysis/AllocaSSA.cpp
+  analysis/costModel.cpp
+  analysis/DFG.cpp
+  analysis/loopAnnotations.cpp
+  analysis/predicateAnalysis.cpp
+  analysis/VectorizationAnalysis.cpp
+  analysis/reductionAnalysis.cpp
+  analysis/reductions.cpp
+  analysis/UndeadMaskAnalysis.cpp
+  config.cpp
+  init.cpp
+  intrinsics.cpp
+  native/MemoryAccessGrouper.cpp
+  native/NatBuilder.cpp
+  native/ShuffleBuilder.cpp
+  native/Utils.cpp
+  region/FunctionRegion.cpp
+  region/LoopRegion.cpp
+  region/Region.cpp
+  registerPasses.cpp
+  report.cpp
+  rv.cpp
+  rvConfig.cpp
+  rvDebug.cpp
+  TargetDesc.cpp
+  passes.cpp
+  resolver/recResolver.cpp
+  resolver/resolver.cpp
+  resolver/listResolver.cpp
+  resolver/sleefResolver.cpp
+  resolver/TLIResolver.cpp
+  shape/vectorShape.cpp
+  shape/vectorShapeTransformer.cpp
+  transform/CNSPass.cpp
+  transform/Linearizer.cpp
+  transform/LoopVectorizer.cpp
+  transform/bosccTransform.cpp
+  transform/crtLowering.cpp
+  transform/cns/BlockGraph.cpp
+  transform/cns/CNS.cpp
+  transform/cns/CNSScoring.cpp
+  transform/cns/SplitTree.cpp
+  transform/cns/llvmDomination.cpp
+  transform/cns/llvmDuplication.cpp
+  transform/divLoopTrans.cpp
+  transform/irPolisher.cpp
+  transform/loopCloner.cpp
+  transform/loopExitCanonicalizer.cpp
+  transform/lowerDivergentSwitches.cpp
+  transform/maskExpander.cpp
+  transform/memCopyElision.cpp
+  transform/redTools.cpp
+  transform/redOpt.cpp
+  transform/remTransform.cpp
+  transform/singleReturnTrans.cpp
+  transform/srovTransform.cpp
+  transform/structOpt.cpp
+  transform/splitAllocas.cpp
+  transform/WFVPass.cpp
+  utils.cpp
+  utils/rvLinking.cpp
+  utils/rvTools.cpp
+  vectorMapping.cpp
+  vectorizationInfo.cpp
+  ${RV_HEADER_FILES}
+)
 
-# enable c++11
-IF (NOT MSVC)
-    SET(CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS} " -fPIC -fno-rtti" )
-ELSE ()
-    ADD_DEFINITIONS ( "-DRV_LIB" )
-    ADD_DEFINITIONS ( "-DRV_STATIC_LIBS" )
-    # suppress redundant warnings
-    ADD_DEFINITIONS ( "-D_SCL_SECURE_NO_WARNINGS -D_CRT_SECURE_NO_WARNINGS" )
-    ADD_DEFINITIONS ( "/wd4244 /wd4800")
-ENDIF ()
+if (TARGET gensleef)
+  target_link_libraries(RV PRIVATE gensleef)
+ENDIF()
 
-SET ( RV_GLOBAL_INCLUDES "${PROJ_ROOT_DIR}/include" )
-FILE ( GLOB RV_GLOBAL_INCLUDE_FILES "${RV_GLOBAL_INCLUDES}/rv/**/*.h" )
+if (BUILD_SHARED_LIBS)
+  target_link_libraries(RV PUBLIC
+    LLVMSupport
+    LLVMCore
+    LLVMScalarOpts
+    LLVMAggressiveInstCombine
+    LLVMTransformUtils
+    LLVMAnalysis
+    LLVMipo
+    LLVMMC
+    LLVMIRReader
+    LLVMPasses
+# The libraries below are required for darwin: http://PR26392
+    LLVMBitReader
+    LLVMMCParser
+    LLVMObject
+    LLVMProfileData
+    LLVMTarget
+    LLVMVectorize
+  )
+  link_directories(
+    ${LLVM_LIBRARY_DIR}
+  )
+elseif (LLVM_LINK_LLVM_DYLIB)
+  target_link_libraries(RV
+    LLVM
+  )
+  link_directories(
+    ${LLVM_LIBRARY_DIR}
+  )
+endif()
 
-INCLUDE_DIRECTORIES ( ${PROJ_SOURCE_DIR} )
-INCLUDE_DIRECTORIES ( ${RV_GLOBAL_INCLUDES} )
-INCLUDE_DIRECTORIES ( ${LLVM_INCLUDE_DIRS} )
+# Build a monolithic libRV.a and a thin module LLVMRV.moduleext that links to
+# that static library.
+if (MSVC)
+  # Add dummy target, because loadable modules are not supported on Windows
+  add_custom_target(LLVMRV)
+  set_target_properties(LLVMRV PROPERTIES FOLDER "rv")
+else ()
+  add_rv_loadable_module(LLVMRV
+    rv.cpp
+  )
 
-# get source files
-FILE ( GLOB NATIVE_CPP          native/*.cpp )
-FILE ( GLOB CPP_GLOBAL          *.cpp )
-FILE ( GLOB CPP_UTILS           utils/*.cpp )
-FILE ( GLOB STAGES              stages/*.cpp )
-FILE ( GLOB CPP_ANALYSIS        analysis/*.cpp )
-FILE ( GLOB RV                 rv/*.cpp )
-FILE ( GLOB REGIONS             rv/Region/*.cpp )
-FILE ( GLOB PDA                 pda/*.cpp )
-FILE ( GLOB CPP_FUNCTIONPASSES  functionPasses/*.cpp )
-FILE ( GLOB CPP_FUNCTIONPASSES2 functionPasses/functionVectorization/*.cpp )
-FILE ( GLOB OPT_PASSES pass/*.cpp )
+target_link_libraries(LLVMRV PRIVATE RV)
 
-SET ( RV_SOURCE_FILES ${CPP_GLOBAL} ${CPP_UTILS} ${STAGES} ${CPP_ANALYSIS} ${CPP_FUNCTIONPASSES} ${CPP_FUNCTIONPASSES2} ${REGIONS} ${RV} ${PDA} ${NATIVE_CPP} ${OPT_PASSES} analysis/MetadataMaskAnalyzer.cpp)
-
-# create libRV
-INCLUDE ( rv-shared )
-ADD_LIBRARY ( ${LIBRARY_NAME} SHARED ${RV_SOURCE_FILES} )
-
-LINK_DIRECTORIES ( ${LLVM_LIBRARY_DIRS} )
-get_rv_llvm_dependency_libs ( LLVM_LIBRARIES )
-TARGET_LINK_LIBRARIES ( ${LIBRARY_NAME} ${LLVM_LIBRARIES} )
-
-# build additional lib
-IF ( VECTOR_ISA  STREQUAL "avx")
-    ADD_CUSTOM_COMMAND (
-        OUTPUT ${RV_LIB_PATH}
-        COMMAND ${LLVM_TOOL_LLVMAS} ${RV_LIB_DIR}/generated.ll -o ${CMAKE_BINARY_DIR}/generated.bc
-        COMMAND ${LLVM_TOOL_CLANG} ${RV_LIB_MATH_DIR}/avx_mathfun.c -emit-llvm -c -Wall -mavx2 -o ${CMAKE_BINARY_DIR}/avx_mathfun.bc
-        COMMAND ${LLVM_TOOL_CLANG} ${RV_LIB_MATH_DIR}/sse_mathfun.c -emit-llvm -c -Wall -msse4.2 -o ${CMAKE_BINARY_DIR}/sse_mathfun.bc
-        COMMAND ${LLVM_TOOL_LINK} ${CMAKE_BINARY_DIR}/generated.bc
-                ${CMAKE_BINARY_DIR}/avx_mathfun.bc
-                ${CMAKE_BINARY_DIR}/sse_mathfun.bc
-                -o ${CMAKE_BINARY_DIR}/rvlib_unopt.bc
-        COMMAND ${LLVM_TOOL_OPT} ${CMAKE_BINARY_DIR}/rvlib_unopt.bc -O3 -o ${RV_LIB_PATH}
-    )
-ENDIF ()
-IF ( VECTOR_ISA STREQUAL "neon")
-    ADD_CUSTOM_COMMAND (
-        OUTPUT ${RV_LIB_PATH}
-        COMMAND ${LLVM_TOOL_LLVMAS} ${RV_LIB_DIR}/generated.ll -o ${CMAKE_BINARY_DIR}/generated.bc
-        COMMAND ${LLVM_TOOL_CLANG} ${RV_LIB_MATH_DIR}/neon_mathfun.c -emit-llvm -c -Wall -o ${CMAKE_BINARY_DIR}/neon_mathfun.bc
-        COMMAND ${LLVM_TOOL_LINK} ${CMAKE_BINARY_DIR}/generated.bc
-                ${CMAKE_BINARY_DIR}/neon_mathfun.bc
-                -o ${CMAKE_BINARY_DIR}/rvlib_unopt.bc
-        COMMAND ${LLVM_TOOL_OPT} ${CMAKE_BINARY_DIR}/rvlib_unopt.bc -O3 -o ${RV_LIB_PATH}
-    )
-ENDIF ()
-
-ADD_CUSTOM_TARGET ( RVLIB DEPENDS ${RV_LIB_PATH} )
-ADD_DEPENDENCIES ( ${LIBRARY_NAME} RVLIB )
-
-# make install
-SET ( CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE )
-
-# public headers
-FILE ( GLOB RV_INCLUDES_RV "${RV_GLOBAL_INCLUDES}/rv/*.h" )
-INSTALL ( FILES ${RV_INCLUDES_RV} DESTINATION ${PROJ_INCLUDE_DIR}/rv )
-FILE ( GLOB RV_INCLUDES_RV_PDA "${RV_GLOBAL_INCLUDES}/rv/pda/*.h" )
-INSTALL ( FILES ${RV_INCLUDES_RV_PDA} DESTINATION ${PROJ_INCLUDE_DIR}/rv/pda )
-FILE ( GLOB RV_INCLUDES_RV_ANALYSIS "${RV_GLOBAL_INCLUDES}/rv/analysis/*.h" )
-INSTALL ( FILES ${RV_INCLUDES_RV_ANALYSIS} DESTINATION ${PROJ_INCLUDE_DIR}/rv/analysis )
-FILE ( GLOB RV_INCLUDES_RV_REGION "${RV_GLOBAL_INCLUDES}/rv/Region/*.h" )
-INSTALL ( FILES ${RV_INCLUDES_RV_REGION} DESTINATION ${PROJ_INCLUDE_DIR}/rv/Region )
-FILE ( GLOB RV_INCLUDES_RV_TRANSFORMS "${RV_GLOBAL_INCLUDES}/rv/transforms/*.h" )
-INSTALL ( FILES ${RV_INCLUDES_RV_TRANSFORMS} DESTINATION ${PROJ_INCLUDE_DIR}/rv/transforms )
-FILE ( GLOB RV_INCLUDES_RV_UTILS "${RV_GLOBAL_INCLUDES}/rv/utils/*.h" )
-INSTALL ( FILES ${RV_INCLUDES_RV_UTILS} DESTINATION ${PROJ_INCLUDE_DIR}/rv/utils )
-INSTALL ( FILES ${RV_LIB_PATH} DESTINATION ${PROJ_LIBRARY_DIR} )
-
-# libRV
-INSTALL ( TARGETS ${LIBRARY_NAME} LIBRARY DESTINATION lib)
-
-# make rvTestSuite
-SET ( RV_TEST_PATH "${PROJ_ROOT_DIR}/test" )
-SET ( RV_TESTSUITE_PATH "${RV_TEST_PATH}/wfv1testsuite" )
-
-SET ( RV_TESTSUITE_NAME "wfvTestSuite" )
-SET ( TESTSUITE_SOURCE_FILES ${RV_TESTSUITE_PATH}/wfvTestSuite.cpp )
-
-IF ( APPLE )
-    SET ( STD_LIB "-std=c++11" "-stdlib=libstdc++" )
-ENDIF ()
-
-INCLUDE_DIRECTORIES ( ${RV_TEST_PATH}/include )
-ADD_EXECUTABLE ( ${RV_TESTSUITE_NAME} ${TESTSUITE_SOURCE_FILES} )
-TARGET_LINK_LIBRARIES ( ${RV_TESTSUITE_NAME} ${LLVM_LIBRARIES} ${LIBRARY_NAME} )
-
-IF( VECTOR_ISA  STREQUAL "avx")
-    SET ( TEST_VEC_FLAG "-msse4.2" )
-    # AVX-only test cases
-    SET ( TEST_SUITE_TESTS1 "${RV_TESTSUITE_PATH}/wfvTests.bc" )
-    ADD_CUSTOM_COMMAND (
-        OUTPUT ${TEST_SUITE_TESTS1}
-        COMMAND ${LLVM_TOOL_CLANGPP} ${STD_LIB} ${RV_TESTSUITE_PATH}/wfvTests.cpp  -c -emit-llvm -Wall ${TEST_VEC_FLAG} -o ${RV_TESTSUITE_PATH}/wfvTests.bc
-    )
-    ADD_CUSTOM_TARGET ( wfvTest1 DEPENDS ${TEST_SUITE_TESTS1} )
-    ADD_DEPENDENCIES ( ${RV_TESTSUITE_NAME} wfvTest1 )
-ENDIF ()
-
-#TODO: clion workaround for install target. remove before release
-add_custom_target(install_${PROJECT_NAME}
-        make install
-        COMMENT "Installing ${PROJECT_NAME}")
+set_target_properties(LLVMRV
+    PROPERTIES
+    LINKER_LANGUAGE CXX
+    PREFIX "")
+endif ()

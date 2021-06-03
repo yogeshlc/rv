@@ -9,15 +9,25 @@
 #ifndef RV_RV_H
 #define RV_RV_H
 
-#include "rv/vectorizationInfo.h"
-#include "rv/pda/DFG.h"
-#include "rv/analysis/maskAnalysis.h"
-#include "rv/analysis/loopLiveValueAnalysis.h"
-#include "rv/rvInfo.h"
+#include "rv/PlatformInfo.h"
+#include "rv/transform/maskExpander.h"
+#include "rv/config.h"
 
-using namespace llvm;
+#include "llvm/Transforms/Utils/ValueMapper.h"
+
+namespace llvm {
+  class LoopInfo;
+  struct PostDominatorTree;
+  class DominatorTree;
+  class ScalarEvolution;
+  class MemoryDependenceResults;
+  class BranchProbabilityInfo;
+}
 
 namespace rv {
+
+class VectorizationInfo;
+
 /*
  * The new vectorizer interface.
  *
@@ -33,79 +43,67 @@ namespace rv {
  */
 class VectorizerInterface {
 public:
-    VectorizerInterface(RVInfo& F, Function* scalarCopy);
-    //~VectorizerInterface();
+    VectorizerInterface(PlatformInfo & _platform, Config config = Config());
 
-    /*
-     * Analyze properties of the scalar function that are needed later in transformations
-     * towards its SIMD equivalent.
-     *
-     * This expects initial information about arguments to be set in the VectorizationInfo object
-     * (see VectorizationInfo).
-     */
-    void analyze(VectorizationInfo& vectorizationInfo,
-                 const CDG& cdg,
-                 const DFG& dfg,
-                 const LoopInfo& loopInfo,
-                 const PostDominatorTree& postDomTree,
-                 const DominatorTree& domTree);
+    // try to inline common math functions (compiler-rt) before the analysis
+    void lowerRuntimeCalls(VectorizationInfo & vecInfo, llvm::LoopInfo & loopInfo);
 
-    /*
-     * Analyze mask values needed to mask certain values and preserve semantics of the function
-     * after its control flow is linearized where needed.
-     */
-    MaskAnalysis* analyzeMasks(VectorizationInfo& vectorizationInfo, const LoopInfo& loopinfo);
+    //
+    // Analyze properties of the scalar function that are needed later in transformations
+    // towards its SIMD equivalent.
+    //
+    // This expects initial information about arguments to be set in the VectorizationInfo object
+    // (see VectorizationInfo).
+    //
+    void analyze(VectorizationInfo& vecInfo,
+                 const llvm::DominatorTree & domTree,
+                 const llvm::PostDominatorTree & postDomTree,
+                 const llvm::LoopInfo& loopInfo);
 
-    /*
-     * Materialize the mask information.
-     */
-    bool generateMasks(VectorizationInfo& vectorizationInfo,
-                       MaskAnalysis& maskAnalysis,
-                       const LoopInfo& loopInfo);
-
-    /*
-     * Linearize divergent regions of the scalar function to preserve semantics for the
-     * vectorized function
-     */
-    bool linearizeCFG(VectorizationInfo& vectorizationInfo,
-                      MaskAnalysis& maskAnalysis,
-                      LoopInfo& loopInfo,
-                      const PostDominatorTree& postDomTree,
-                      const DominatorTree& domTree);
-
-    /*
-     * Produce vectorized instructions
-     */
+    //
+    // Linearize divergent regions of the scalar function to preserve semantics for the
+    // vectorized function
+    //
     bool
-    vectorize(VectorizationInfo& vecInfo, const DominatorTree& domTree);
+    linearize(VectorizationInfo& vecInfo,
+              llvm::DominatorTree& domTree,
+              llvm::PostDominatorTree& postDomTree,
+              llvm::LoopInfo& loopInfo,
+              llvm::BranchProbabilityInfo * pbInfo = nullptr);
 
-    /*
-     * Ends the vectorization process on this function, removes metadata and
-     * writes the function to a file
-     */
+    //
+    // Produce vectorized instructions
+    //
+    bool
+    vectorize(VectorizationInfo &vecInfo,
+              llvm::DominatorTree &domTree,
+              llvm::LoopInfo & loopInfo,
+              llvm::ScalarEvolution & SE,
+              llvm::MemoryDependenceResults & MDR,
+              llvm::ValueToValueMapTy * vecInstMap);
+
+    //
+    // Ends the vectorization process on this function, removes metadata and
+    // writes the function to a file
+    //
     void finalize();
 
-    bool addSIMDSemantics(const Function& f,
-                          const bool      isOpUniform,
-                          const bool      isOpVarying,
-                          const bool      isOpSequential,
-                          const bool      isOpSequentialGuarded,
-                          const bool      isResultUniform,
-                          const bool      isResultVector,
-                          const bool      isResultScalars,
-                          const bool      isAligned,
-                          const bool      isIndexSame,
-                          const bool      isIndexConsecutive);
+    PlatformInfo & getPlatformInfo() const { return platInfo; }
+    llvm::Module & getModule() const { return getPlatformInfo().getModule(); }
+
+    const Config & getConfig() const { return config; }
 
 private:
-    RVInfo&                       mInfo;
-    Function*                      mScalarFn;
-
-    bool verifyVectorizedType(Type* scalarType, Type* vecType);
-    bool verifyFunctionSignaturesMatch(const Function& F1, const Function& F2);
-    void addPredicateInstrinsics();
+    Config config;
+    PlatformInfo & platInfo;
 };
 
+
+   // implement all rv_* intrinsics
+   // this is necessary to make scalar functions with predicate intrinsics executable
+   // the SIMS semantics of the function will change if @scalar func used any mask intrinsics
+  void lowerIntrinsics(llvm::Function & scalarFunc);
+  void lowerIntrinsics(llvm::Module & mod);
 }
 
 #endif // RV_RV_H
